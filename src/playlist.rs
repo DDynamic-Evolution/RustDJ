@@ -51,26 +51,25 @@ impl Item {
 fn read_playlist(path: &Path) -> Result<(Vec<Item>, usize), String> {
     let mut bytes = Vec::new();
     File::open(path)
-        .map_err(|e| format!("Playlist nicht lesbar: {e}"))?
+        .map_err(|e| format!("Could not read playlist: {e}"))?
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err("Playlist ist größer als 16 MB.".into());
+        return Err("The playlist exceeds 16 MB.".into());
     }
     let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "Playlist ist nicht UTF-8-kodiert. Bitte als M3U8 speichern.")?
+        .map_err(|_| "The playlist is not UTF-8 encoded. Please save it as M3U8.")?
         .trim_start_matches('\u{feff}');
     let base = std::path::absolute(path).map_err(|e| e.to_string())?;
-    let base = base.parent().ok_or("Playlist hat keinen Ordner")?;
+    let base = base.parent().ok_or("The playlist has no parent folder")?;
     let mut items = Vec::new();
     let mut title = None;
     let mut skipped = 0;
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if line.starts_with("#EXT-X-") {
             return Err(
-                "HLS-Streams werden nicht unterstützt. Bitte eine lokale Musik-Playlist öffnen."
-                    .into(),
+                "HLS streams are not supported. Open a local music playlist instead.".into(),
             );
         }
         if let Some(info) = line.strip_prefix("#EXTINF:") {
@@ -91,7 +90,7 @@ fn read_playlist(path: &Path) -> Result<(Vec<Item>, usize), String> {
         }
     }
     if items.is_empty() && skipped > 0 {
-        return Err("Keine unterstützten lokalen Musikdateien in dieser Playlist.".into());
+        return Err("This playlist contains no supported local music files.".into());
     }
     Ok((items, skipped))
 }
@@ -102,9 +101,9 @@ fn write_playlist(path: &Path, items: &[Item]) -> Result<(), String> {
         let absolute = std::path::absolute(&item.path).map_err(|e| e.to_string())?;
         let file = absolute
             .to_str()
-            .ok_or("Dateipfad kann nicht als UTF-8 gespeichert werden.")?;
+            .ok_or("The file path cannot be saved as UTF-8.")?;
         if file.contains(['\r', '\n', '\0']) {
-            return Err("Ein Dateipfad enthält ungültige Zeichen.".into());
+            return Err("A file path contains invalid characters.".into());
         }
         let duration = item
             .summary
@@ -116,7 +115,7 @@ fn write_playlist(path: &Path, items: &[Item]) -> Result<(), String> {
         ));
     }
     let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
-    let parent = absolute.parent().ok_or("Kein Playlist-Ordner")?;
+    let parent = absolute.parent().ok_or("No playlist folder")?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -129,7 +128,7 @@ fn write_playlist(path: &Path, items: &[Item]) -> Result<(), String> {
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(|e| format!("Temporäre Playlist nicht erstellt: {e}"))?;
+        .map_err(|e| format!("Could not create temporary playlist: {e}"))?;
     let result = (|| {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -138,7 +137,7 @@ fn write_playlist(path: &Path, items: &[Item]) -> Result<(), String> {
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
-        return Err(format!("Playlist nicht gespeichert: {error}"));
+        return Err(format!("Playlist was not saved: {error}"));
     }
     Ok(())
 }
@@ -219,8 +218,7 @@ impl Playlist {
         self.selected = None;
         self.modified = false;
         self.error = None;
-        self.notice =
-            (skipped > 0).then(|| format!("{skipped} nicht unterstützte Einträge übersprungen."));
+        self.notice = (skipped > 0).then(|| format!("Skipped {skipped} unsupported entries."));
         self.metadata = None;
         Ok(())
     }
@@ -230,15 +228,15 @@ impl Playlist {
         self.path = Some(path);
         self.modified = false;
         self.error = None;
-        self.notice = Some(format!("Playlist gespeichert: {} Titel.", self.items.len()));
+        self.notice = Some(format!("Playlist saved: {} tracks.", self.items.len()));
         Ok(())
     }
 
     fn save_dialog(&mut self, save_as: bool) -> bool {
         let path = if save_as || self.path.is_none() {
             let mut dialog = rfd::FileDialog::new()
-                .set_title("Playlist speichern")
-                .add_filter("M3U8-Playlist (UTF-8)", &["m3u8"])
+                .set_title("Save playlist")
+                .add_filter("M3U8 playlist (UTF-8)", &["m3u8"])
                 .set_file_name(
                     self.path
                         .as_ref()
@@ -284,8 +282,8 @@ impl Playlist {
             }
             Pending::Open => {
                 let mut dialog = rfd::FileDialog::new()
-                    .set_title("Playlist laden")
-                    .add_filter("M3U-/M3U8-Playlist (UTF-8)", &["m3u8", "m3u"]);
+                    .set_title("Load playlist")
+                    .add_filter("M3U/M3U8 playlist (UTF-8)", &["m3u8", "m3u"]);
                 if let Some(parent) = self.path.as_ref().and_then(|p| p.parent()) {
                     dialog = dialog.set_directory(parent);
                 }
@@ -320,19 +318,19 @@ impl Playlist {
             let mut choice = None;
             egui::Modal::new(egui::Id::new("playlist-unsaved")).show(ctx, |ui| {
                 ui.set_max_width(470.0);
-                ui.heading("Playlist speichern?");
-                ui.label("Die Playlist enthält ungespeicherte Änderungen.");
+                ui.heading("Save playlist?");
+                ui.label("The playlist has unsaved changes.");
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Speichern und fortfahren").clicked() {
+                    if ui.button("Save and continue").clicked() {
                         choice = Some(0);
                     }
-                    if ui.button("Verwerfen").clicked() {
+                    if ui.button("Discard").clicked() {
                         choice = Some(1);
                     }
-                    if ui.button("Abbrechen").clicked() {
+                    if ui.button("Cancel").clicked() {
                         choice = Some(2);
                     }
                 });
@@ -435,20 +433,20 @@ impl Playlist {
     ) -> Option<(usize, PathBuf)> {
         self.poll();
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Neu").clicked() {
+            if ui.button("New").clicked() {
                 self.request(Pending::New, ctx);
             }
-            if ui.button("Laden …").clicked() {
+            if ui.button("Load …").clicked() {
                 self.request(Pending::Open, ctx);
             }
-            if ui.button("Speichern").clicked() {
+            if ui.button("Save").clicked() {
                 self.save_dialog(false);
             }
-            if ui.button("Speichern unter …").clicked() {
+            if ui.button("Save as …").clicked() {
                 self.save_dialog(true);
             }
         });
-        let name = self.path.as_ref().map_or("Neue Playlist".into(), |p| {
+        let name = self.path.as_ref().map_or("New playlist".into(), |p| {
             p.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -457,7 +455,7 @@ impl Playlist {
         ui.add(
             egui::Label::new(
                 RichText::new(format!(
-                    "{}{} · {} Titel",
+                    "{}{} · {} tracks",
                     name,
                     if self.modified { " *" } else { "" },
                     self.items.len()
@@ -469,17 +467,17 @@ impl Playlist {
         .on_hover_text(
             self.path
                 .as_ref()
-                .map_or("Noch nicht gespeichert".into(), |p| p.display().to_string()),
+                .map_or("Not saved yet".into(), |p| p.display().to_string()),
         );
         ui.horizontal_wrapped(|ui| {
-            if ui.button("+ Dateien …").clicked()
+            if ui.button("+ Files …").clicked()
                 && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Musikdateien", track::EXTENSIONS)
+                    .add_filter("Music files", track::EXTENSIONS)
                     .pick_files()
             {
                 self.add(paths, ctx);
             }
-            if ui.small_button("Werte aktualisieren").clicked() {
+            if ui.small_button("Refresh metadata").clicked() {
                 self.refresh(ctx);
             }
             if self.metadata.is_some() {
@@ -489,7 +487,7 @@ impl Playlist {
         ui.horizontal(|ui| {
             let selected = self.selected.filter(|i| *i < self.items.len());
             if ui
-                .add_enabled(selected.is_some_and(|i| i > 0), egui::Button::new("Hoch"))
+                .add_enabled(selected.is_some_and(|i| i > 0), egui::Button::new("Up"))
                 .clicked()
             {
                 self.move_selected(-1);
@@ -497,14 +495,14 @@ impl Playlist {
             if ui
                 .add_enabled(
                     selected.is_some_and(|i| i + 1 < self.items.len()),
-                    egui::Button::new("Runter"),
+                    egui::Button::new("Down"),
                 )
                 .clicked()
             {
                 self.move_selected(1);
             }
             if ui
-                .add_enabled(selected.is_some(), egui::Button::new("Entfernen"))
+                .add_enabled(selected.is_some(), egui::Button::new("Remove"))
                 .clicked()
             {
                 self.remove_selected();
@@ -526,9 +524,9 @@ impl Playlist {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.items.is_empty() {
-                    ui.label("Musik aus dem Browser hierher ziehen.");
+                    ui.label("Drag music here from the browser.");
                     ui.label(
-                        RichText::new("Oder mit „+ Dateien …“ mehrere Titel hinzufügen.")
+                        RichText::new("Or use “+ Files …” to add multiple tracks.")
                             .small()
                             .weak(),
                     );
@@ -584,7 +582,7 @@ impl Playlist {
                         });
                         ui.label(
                             RichText::new(if item.available == Some(false) {
-                                "Datei fehlt · Pfad prüfen".into()
+                                "File missing · Check the path".into()
                             } else {
                                 format!("{bpm} · {key}{length}")
                             })

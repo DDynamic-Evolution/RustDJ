@@ -35,7 +35,7 @@ impl Fingerprint {
     pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
         let modified = metadata.modified().map_err(|e| e.to_string())?;
         Ok(Self {
-            bytes: metadata.len().try_into().map_err(|_| "Datei zu groß")?,
+            bytes: metadata.len().try_into().map_err(|_| "File is too large")?,
             modified_ns: match modified.duration_since(UNIX_EPOCH) {
                 Ok(d) => d.as_nanos().to_string(),
                 Err(e) => format!("-{}", e.duration().as_nanos()),
@@ -113,9 +113,9 @@ pub struct Database {
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Datenbankordner: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("Database folder: {e}"))?;
         }
-        let connection = Connection::open(path).map_err(|e| format!("Musikdatenbank: {e}"))?;
+        let connection = Connection::open(path).map_err(|e| format!("Music database: {e}"))?;
         connection
             .busy_timeout(Duration::from_secs(3))
             .map_err(|e| e.to_string())?;
@@ -123,7 +123,7 @@ impl Database {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| e.to_string())?;
         if version > 1 {
-            return Err("Musikdatenbank stammt aus einer neueren RustDJ-Version.".into());
+            return Err("The music database was created by a newer version of RustDJ.".into());
         }
         connection
             .execute_batch(
@@ -142,7 +142,7 @@ impl Database {
                 version INTEGER NOT NULL, frames INTEGER NOT NULL, step REAL NOT NULL, data BLOB NOT NULL
             );",
             )
-            .map_err(|e| format!("Musikdatenbank initialisieren: {e}"))?;
+            .map_err(|e| format!("Could not initialize music database: {e}"))?;
         if version == 0 {
             connection
                 .pragma_update(None, "user_version", 1)
@@ -225,7 +225,7 @@ impl Database {
                 .duration
                 .as_nanos()
                 .try_into()
-                .map_err(|_| "Track zu lang")?,
+                .map_err(|_| "Track is too long")?,
             sample_rate: track.sample_rate,
             channels: track.channels,
             envelope_step: track.envelope_step,
@@ -240,13 +240,13 @@ impl Database {
             file_size=excluded.file_size,modified_ns=excluded.modified_ns,analysis_version=excluded.analysis_version,
             result_json=excluded.result_json,waveform=excluded.waveform,envelope=excluded.envelope,analysed_at=excluded.analysed_at",
             params![path_key(&track.path), identity.bytes, identity.modified_ns, ANALYSIS_VERSION, json, encode_peaks(&track.waveform), encode_peaks(&track.envelope), time]
-        ).map_err(|e| format!("Analyse nicht gespeichert: {e}"))?;
+        ).map_err(|e| format!("Analysis was not saved: {e}"))?;
         self.connection.execute(
             "INSERT INTO colour_waveforms(path,file_size,modified_ns,version,frames,step,data) VALUES(?1,?2,?3,1,?4,?5,?6)
             ON CONFLICT(path) DO UPDATE SET file_size=excluded.file_size,modified_ns=excluded.modified_ns,
             version=excluded.version,frames=excluded.frames,step=excluded.step,data=excluded.data",
             params![path_key(&track.path), identity.bytes, identity.modified_ns, track.detailed.frames().len() as i64, track.detailed.step, track.detailed.encode()?]
-        ).map_err(|e| format!("Farbige Wellenform nicht gespeichert: {e}"))?;
+        ).map_err(|e| format!("Color waveform was not saved: {e}"))?;
         Ok(())
     }
 
@@ -286,7 +286,7 @@ impl Database {
             "INSERT INTO hotcues(path,file_size,modified_ns,cues_json) VALUES(?1,?2,?3,?4)
             ON CONFLICT(path) DO UPDATE SET file_size=excluded.file_size,modified_ns=excluded.modified_ns,cues_json=excluded.cues_json",
             params![path_key(path), identity.bytes, identity.modified_ns, json]
-        ).map_err(|e| format!("Hotcues nicht gespeichert: {e}"))?;
+        ).map_err(|e| format!("Hotcues were not saved: {e}"))?;
         Ok(())
     }
 }

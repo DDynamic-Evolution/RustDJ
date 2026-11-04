@@ -258,7 +258,7 @@ impl Deck {
                 {
                     Ok(cues) => cues.map(|cue| cue.filter(|p| *p < track.duration)),
                     Err(error) => {
-                        track.cache_warning = Some(format!("Hotcues nicht geladen: {error}"));
+                        track.cache_warning = Some(format!("Hotcues were not loaded: {error}"));
                         [None; 8]
                     }
                 };
@@ -291,7 +291,7 @@ impl Deck {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => {
-                    Err("Der Audio-Ladevorgang wurde beendet.".into())
+                    Err("Audio loading stopped unexpectedly.".into())
                 }
             }
         };
@@ -341,7 +341,7 @@ impl Deck {
             stream,
             audio.routing.master.pair,
             self.eq_params.clone(),
-            audio.bus(false).ok_or("Master-Mischbus fehlt.")?,
+            audio.bus(false).ok_or("Master mixing bus is missing.")?,
             self.fx_params.clone(),
         )?;
         let phones = match (audio.phones(), &audio.routing.phones) {
@@ -350,7 +350,7 @@ impl Deck {
                 stream,
                 target.pair,
                 self.eq_params.clone(),
-                audio.bus(true).ok_or("Kopfhörer-Mischbus fehlt.")?,
+                audio.bus(true).ok_or("Headphone mixing bus is missing.")?,
                 self.fx_params.clone(),
             )?),
             _ => None,
@@ -434,7 +434,7 @@ impl Deck {
 
     fn ensure_source(&mut self, audio: &Audio) -> bool {
         if audio.stream.is_none() {
-            self.error = Some("Kein Audioausgang. Audio erneut verbinden.".into());
+            self.error = Some("No audio output. Reconnect audio.".into());
             return false;
         }
         let Some(track) = &self.track else {
@@ -469,7 +469,7 @@ impl Deck {
         if let Some(sink) = &self.sink
             && let Err(error) = sink.seek_media(target)
         {
-            self.error = Some(format!("Position konnte nicht gesetzt werden: {error}"));
+            self.error = Some(format!("Could not set playback position: {error}"));
         }
     }
 
@@ -529,9 +529,7 @@ impl Deck {
                     .as_ref()
                     .is_some_and(|p| p.fault.swap(false, Ordering::Relaxed))
             {
-                self.error = Some(
-                    "Loop-Transport konnte die Decoderposition nicht wiederherstellen.".into(),
-                );
+                self.error = Some("Loop transport could not restore the decoder position.".into());
             }
             sink.master.set_volume(master_gain);
             sink.set_speed(self.speed);
@@ -579,7 +577,7 @@ impl Deck {
                                 Duration::from_secs_f64(master as f64 / samples_per_second);
                             if let Err(error) = phones.try_seek(position.div_f32(phones.speed())) {
                                 self.error =
-                                    Some(format!("Kopfhörer-Abgleich fehlgeschlagen: {error}"));
+                                    Some(format!("Headphone synchronization failed: {error}"));
                             }
                         }
                     }
@@ -697,7 +695,7 @@ impl Deck {
         let result = match job.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err("Loop-Vorbereitung wurde beendet.".into()),
+            Err(TryRecvError::Disconnected) => Err("Loop preparation stopped unexpectedly.".into()),
         };
         let resume_after_eof = job.resume_after_eof;
         self.loop_job = None;
@@ -737,7 +735,7 @@ impl Deck {
             return;
         };
         let Some(grid) = self.grid else {
-            self.error = Some("Für Beat-Loops zuerst BPM analysieren oder setzen.".into());
+            self.error = Some("Analyze or set BPM before using beat loops.".into());
             return;
         };
         let position = if self.loop_active || self.loop_pending() {
@@ -800,7 +798,7 @@ impl Deck {
                 audio,
             );
         } else {
-            self.error = Some("Zuerst Loop IN setzen.".into());
+            self.error = Some("Set Loop IN first.".into());
         }
     }
 

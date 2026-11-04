@@ -24,10 +24,10 @@ pub fn unprotect(blob: &[u8]) -> Result<String, String> {
     let mut clear = transform(blob, false)?;
     let result = clear
         .strip_prefix(MARKER)
-        .ok_or_else(|| "Gespeichertes Stream-Passwort hat ein ungültiges Format.".to_owned())
+        .ok_or_else(|| "The saved stream password has an invalid format.".to_owned())
         .and_then(|bytes| {
             String::from_utf8(bytes.to_vec())
-                .map_err(|_| "Gespeichertes Stream-Passwort ist beschädigt.".to_owned())
+                .map_err(|_| "The saved stream password is corrupted.".to_owned())
         });
     for byte in &mut clear {
         unsafe {
@@ -46,7 +46,7 @@ fn transform(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
         },
     };
     if data.len() > 1_048_576 {
-        return Err("Gespeichertes Stream-Passwort ist zu groß.".into());
+        return Err("The saved stream password is too large.".into());
     }
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -80,17 +80,13 @@ fn transform(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     };
     if succeeded == 0 {
         return Err(format!(
-            "Windows konnte das Stream-Passwort nicht {}: {}",
-            if encrypt {
-                "schützen"
-            } else {
-                "wiederherstellen"
-            },
+            "Windows could not {} the stream password: {}",
+            if encrypt { "protect" } else { "restore" },
             std::io::Error::last_os_error()
         ));
     }
     if output.pbData.is_null() {
-        return Err("Windows hat keine Passwortdaten zurückgegeben.".into());
+        return Err("Windows returned no password data.".into());
     }
     // The successful API call owns a valid cbData-byte allocation until LocalFree.
     let bytes = unsafe { std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize) };
@@ -110,5 +106,5 @@ fn transform(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 fn transform(_data: &[u8], _encrypt: bool) -> Result<Vec<u8>, String> {
-    Err("Geschütztes Speichern von Stream-Passwörtern benötigt Windows.".into())
+    Err("Protected storage of stream passwords requires Windows.".into())
 }

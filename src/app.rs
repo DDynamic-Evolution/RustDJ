@@ -178,8 +178,8 @@ impl RustDj {
 
     fn pick(&mut self, index: usize, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title(format!("Musik für Deck {} laden", index + 1))
-            .add_filter("Musikdateien", track::EXTENSIONS)
+            .set_title(format!("Load music into Deck {}", index + 1))
+            .add_filter("Music files", track::EXTENSIONS)
             .pick_file()
         {
             self.decks[index].load(path, ctx.clone());
@@ -233,7 +233,7 @@ impl RustDj {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RUST").size(21.0).strong());
             ui.label(RichText::new("DJ").size(21.0).strong().color(PURPLE));
-            ui.label(RichText::new("0.18 / 4 DECKS").size(10.0).color(MUTED));
+            ui.label(RichText::new("0.19 / 4 DECKS").size(10.0).color(MUTED));
             ui.separator();
             let midi =
                 controller_status(self.midi.connected.as_deref(), self.midi.prefs.auto_connect);
@@ -250,7 +250,7 @@ impl RustDj {
             )
             .on_hover_text(midi);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Audio / Ausgänge").clicked() {
+                if ui.button("Audio / Outputs").clicked() {
                     self.show_audio = true;
                     self.refresh_audio_devices(ctx);
                 }
@@ -268,10 +268,10 @@ impl RustDj {
                     .master
                     .device
                     .as_deref()
-                    .unwrap_or("Windows-Standard")
+                    .unwrap_or("Windows default")
             };
             let master = format!(
-                "MASTER · {} · Kanäle {}/{}",
+                "MASTER · {} · Channels {}/{}",
                 master,
                 self.audio.routing.master.pair * 2 + 1,
                 self.audio.routing.master.pair * 2 + 2
@@ -284,15 +284,15 @@ impl RustDj {
                     .routing
                     .phones
                     .as_ref()
-                    .map_or("PHONES · AUS".into(), |target| {
+                    .map_or("PHONES · OFF".into(), |target| {
                         let name = self
                             .audio
                             .phones_name
                             .as_deref()
                             .or(target.device.as_deref())
-                            .unwrap_or("Windows-Standard");
+                            .unwrap_or("Windows default");
                         format!(
-                            "PHONES · {name} · Kanäle {}/{}",
+                            "PHONES · {name} · Channels {}/{}",
                             target.pair * 2 + 1,
                             target.pair * 2 + 2
                         )
@@ -303,9 +303,7 @@ impl RustDj {
                         .frame(false)
                         .truncate(),
                 )
-                .on_hover_text(format!(
-                    "{phones}\nKlicken: Kopfhörer-Ausgabequelle auswählen"
-                ))
+                .on_hover_text(format!("{phones}\nClick to choose the headphone output"))
                 .clicked()
             {
                 self.show_audio = true;
@@ -318,14 +316,14 @@ impl RustDj {
         ui.horizontal(|ui| {
             ui.label(RichText::new("SESSION / SIDELIST").strong());
             ui.label(
-                RichText::new(format!("{} Tracks", self.library.len()))
+                RichText::new(format!("{} tracks", self.library.len()))
                     .small()
                     .color(MUTED),
             );
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text("Geladene Tracks suchen …")
+                .hint_text("Search loaded tracks …")
                 .desired_width(ui.available_width()),
         );
         ui.separator();
@@ -336,11 +334,13 @@ impl RustDj {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.library.is_empty() {
-                    ui.label(RichText::new("Titel aus dem Browser hierher ziehen.").color(MUTED));
+                    ui.label(RichText::new("Drag tracks here from the browser.").color(MUTED));
                     ui.label(
-                        RichText::new("Links Musik auswählen und auf Deck 1, 3, 4 oder 2 laden.")
-                            .small()
-                            .color(MUTED),
+                        RichText::new(
+                            "Select music on the left and load it into Deck 1, 3, 4 or 2.",
+                        )
+                        .small()
+                        .color(MUTED),
                     );
                 }
                 for track in self
@@ -423,7 +423,7 @@ impl RustDj {
         let Some(master) =
             crate::decks::sync_reference(follower, loaded, playing, self.mix_gains().master)
         else {
-            self.notice = Some("Für Sync einen anderen Track laden.".into());
+            self.notice = Some("Load another track to use Sync.".into());
             return;
         };
         self.synced[follower] = Some(master);
@@ -432,7 +432,7 @@ impl RustDj {
                 self.decks[follower].speed = plan.speed;
                 self.decks[follower].seek(plan.position, &self.audio);
                 self.notice = Some(format!(
-                    "Deck {} folgt Deck {}. Tempo-Lock aktiv.",
+                    "Deck {} follows Deck {}. Tempo lock enabled.",
                     follower + 1,
                     master + 1
                 ));
@@ -445,15 +445,15 @@ impl RustDj {
     }
 
     fn sync_plan(&self, follower: usize) -> Result<crate::beat::SyncPlan, String> {
-        let master = self.synced[follower].ok_or("Keine Sync-Referenz gewählt.")?;
+        let master = self.synced[follower].ok_or("No Sync reference selected.")?;
         let follower_grid = self.decks[follower]
             .grid
-            .ok_or("BPM auf dem zu synchronisierenden Deck fehlen.")?;
+            .ok_or("The deck to synchronize has no BPM value.")?;
         let master_grid = self.decks[master]
             .grid
-            .ok_or("BPM auf dem Referenz-Deck fehlen.")?;
+            .ok_or("The reference deck has no BPM value.")?;
         if self.decks[follower].track.is_none() || self.decks[master].track.is_none() {
-            return Err("Für Sync auf beiden Decks einen Track laden.".into());
+            return Err("Load a track into both decks to use Sync.".into());
         }
         sync_plan(
             follower_grid,
@@ -645,32 +645,32 @@ impl RustDj {
 
     fn controller_ui(&mut self, ctx: &egui::Context) {
         egui::Window::new("Controller / MIDI").open(&mut self.show_midi).default_width(650.0).resizable(true).show(ctx, |ui| {
-            ui.label("DJ-202 wird beim Start und nach dem Einstecken automatisch verbunden.");
-            if ui.checkbox(&mut self.midi.prefs.auto_connect, "Automatisch verbinden und nach USB-Trennung erneut suchen").changed() { self.midi.dirty = true; }
+            ui.label("The DJ-202 connects automatically on startup and when plugged in.");
+            if ui.checkbox(&mut self.midi.prefs.auto_connect, "Connect automatically and reconnect after USB disconnection").changed() { self.midi.dirty = true; }
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Bevorzugt: {}", self.midi.prefs.preferred_port.as_deref().unwrap_or("DJ-202 automatisch erkennen"))).small());
-                if ui.small_button("DJ-202 automatisch wählen").clicked() { self.midi.prefs.preferred_port = None; self.midi.prefs.auto_connect = true; self.midi.dirty = true; self.midi.refresh(); }
+                ui.label(RichText::new(format!("Preferred: {}", self.midi.prefs.preferred_port.as_deref().unwrap_or("Detect DJ-202 automatically"))).small());
+                if ui.small_button("Select DJ-202 automatically").clicked() { self.midi.prefs.preferred_port = None; self.midi.prefs.auto_connect = true; self.midi.dirty = true; self.midi.refresh(); }
             });
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("midi-port").selected_text(self.midi.ports.get(self.midi.selected_port).map_or("Keine MIDI-Ports", String::as_str)).width(280.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("midi-port").selected_text(self.midi.ports.get(self.midi.selected_port).map_or("No MIDI ports", String::as_str)).width(280.0).show_ui(ui, |ui| {
                     for (index, name) in self.midi.ports.iter().enumerate() { ui.selectable_value(&mut self.midi.selected_port, index, name); }
                 });
-                if ui.button("Aktualisieren").clicked() { self.midi.refresh(); }
+                if ui.button("Refresh").clicked() { self.midi.refresh(); }
                 if self.midi.connected.is_some() {
-                    if ui.button("Trennen").clicked() { self.midi.disconnect(); }
-                } else if ui.add_enabled(!self.midi.ports.is_empty(), egui::Button::new("Verbinden")).clicked() { self.midi.connect(ctx); }
+                    if ui.button("Disconnect").clicked() { self.midi.disconnect(); }
+                } else if ui.add_enabled(!self.midi.ports.is_empty(), egui::Button::new("Connect")).clicked() { self.midi.connect(ctx); }
             });
-            ui.label(RichText::new(self.midi.connected.as_deref().unwrap_or("Kein Controller verbunden")).color(PURPLE));
+            ui.label(RichText::new(self.midi.connected.as_deref().unwrap_or("No controller connected")).color(PURPLE));
             if let Some(error) = &self.midi.error { ui.colored_label(WARNING, error); }
             ui.horizontal(|ui| {
-                if ui.button("DJ-202-Profil laden").clicked() { self.midi.bindings = midi::dj202_profile(); self.midi.dirty = true; }
-                ui.checkbox(&mut self.midi.dj202_leds, "DJ-202 Transport-/Pad-LEDs");
+                if ui.button("Load DJ-202 profile").clicked() { self.midi.bindings = midi::dj202_profile(); self.midi.dirty = true; }
+                ui.checkbox(&mut self.midi.dj202_leds, "DJ-202 transport/pad LEDs");
             });
-            ui.label(RichText::new("Profil: Decks 1–4, Mixer, Filter/FX, Transport, Browser und alle acht Hotcue-/Loop-Pads. DECK 3/4 schaltet die Controller-Seiten um.").small().color(MUTED));
-            ui.label("Am DJ-202 einmal HOT CUE oder LOOP drücken, dann Pads 1–8 verwenden.");
-            ui.label(RichText::new("HOT CUE: leer = setzen, belegt = springen/spielen; SHIFT+Pad = löschen. LOOP: ¼ · ½ · 1 · 2 · 4 · 8 · 16 · 32 Beats; erneut drücken = aus. PARAM −/+ halbiert/verdoppelt.").small());
+            ui.label(RichText::new("Profile: Decks 1–4, mixer, filter/FX, transport, browser and all eight hotcue/loop pads. DECK 3/4 switches the controller banks.").small().color(MUTED));
+            ui.label("Press HOT CUE or LOOP on the DJ-202, then use pads 1–8.");
+            ui.label(RichText::new("HOT CUE: empty = set, assigned = jump/play; SHIFT+pad = clear. LOOP: ¼ · ½ · 1 · 2 · 4 · 8 · 16 · 32 beats; press again to exit. PARAM −/+ halves/doubles the loop.").small());
             for (deck, mode) in self.midi.pad_modes.iter().enumerate() {
-                ui.label(RichText::new(format!("Deck {} · Pads: {}", deck + 1, mode.map_or("HOT CUE/LOOP am Controller wählen", midi::PadMode::label))).small().color(PURPLE));
+                ui.label(RichText::new(format!("Deck {} · Pads: {}", deck + 1, mode.map_or("Select HOT CUE/LOOP on the controller", midi::PadMode::label))).small().color(PURPLE));
             }
             ui.separator();
             ui.label(RichText::new("MIDI-LEARN").strong());
@@ -678,19 +678,19 @@ impl RustDj {
                 egui::ComboBox::from_id_salt("midi-action").selected_text(self.midi.learn_action.label()).show_ui(ui, |ui| {
                     for action in Action::all() { ui.selectable_value(&mut self.midi.learn_action, action, action.label()); }
                 });
-                egui::ComboBox::from_id_salt("midi-mode").selected_text(match self.midi.learn_mode { Mode::Relative64 => "Encoder: 64 Mitte", Mode::RelativeTwos => "Encoder: 1 / 127", _ => "Taste / Fader (7 Bit)" }).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.midi.learn_mode, Mode::Absolute7, "Taste / Fader (7 Bit)");
-                    ui.selectable_value(&mut self.midi.learn_mode, Mode::Relative64, "Encoder: 64 Mitte");
+                egui::ComboBox::from_id_salt("midi-mode").selected_text(match self.midi.learn_mode { Mode::Relative64 => "Encoder: center 64", Mode::RelativeTwos => "Encoder: 1 / 127", _ => "Button / fader (7-bit)" }).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.midi.learn_mode, Mode::Absolute7, "Button / fader (7-bit)");
+                    ui.selectable_value(&mut self.midi.learn_mode, Mode::Relative64, "Encoder: center 64");
                     ui.selectable_value(&mut self.midi.learn_mode, Mode::RelativeTwos, "Encoder: 1 / 127");
                 });
                 if self.midi.learning.is_some() {
-                    if ui.button("Abbrechen").clicked() { self.midi.learning = None; }
-                } else if ui.add_enabled(self.midi.connected.is_some(), egui::Button::new("Anlernen")).clicked() { self.midi.learning = Some(self.midi.learn_action); }
+                    if ui.button("Cancel").clicked() { self.midi.learning = None; }
+                } else if ui.add_enabled(self.midi.connected.is_some(), egui::Button::new("Learn")).clicked() { self.midi.learning = Some(self.midi.learn_action); }
             });
-            if let Some(action) = self.midi.learning { ui.colored_label(PURPLE, format!("Jetzt Bedienelement für {} betätigen …", action.label())); }
-            if let Some(bytes) = self.midi.last_message { ui.monospace(format!("Letztes MIDI-Signal: {:02X} {:02X} {:02X}", bytes[0], bytes[1], bytes[2])); }
-            if let Some(action) = self.midi.last_action { ui.label(format!("Letzte Controller-Aktion: {}", action.label())); }
-            ui.label(RichText::new("Eigene Belegungen und Browser-Favoriten werden lokal gespeichert.").small().color(MUTED));
+            if let Some(action) = self.midi.learning { ui.colored_label(PURPLE, format!("Move or press a control for {} …", action.label())); }
+            if let Some(bytes) = self.midi.last_message { ui.monospace(format!("Last MIDI message: {:02X} {:02X} {:02X}", bytes[0], bytes[1], bytes[2])); }
+            if let Some(action) = self.midi.last_action { ui.label(format!("Last controller action: {}", action.label())); }
+            ui.label(RichText::new("Custom mappings and browser favorites are saved locally.").small().color(MUTED));
             let mut remove = None;
             egui::ScrollArea::vertical().id_salt("bindings").max_height(260.0).show(ui, |ui| {
                 for (index, binding) in self.midi.bindings.iter().enumerate() {
@@ -711,14 +711,14 @@ impl RustDj {
     fn equalizer_ui(&mut self, ctx: &egui::Context) {
         let mut open = self.show_equalizer;
         let before = self.master_eq;
-        egui::Window::new("10-Band-Master-Equalizer").open(&mut open)
+        egui::Window::new("10-Band Master Equalizer").open(&mut open)
             .default_pos(Pos2::new(200.0, 100.0)).default_width(740.0).resizable(true).vscroll(true).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.master_eq.enabled, "Equalizer aktiv");
-                    if ui.button("Neutral / Reset").clicked() { self.master_eq.preamp = 0.0; self.master_eq.bands = [0.0; 10]; }
+                    ui.checkbox(&mut self.master_eq.enabled, "Enable equalizer");
+                    if ui.button("Flat / Reset").clicked() { self.master_eq.preamp = 0.0; self.master_eq.bands = [0.0; 10]; }
                 });
-                ui.label("Wirkt auf Master, SHOUTcast-Stream und MP3-Aufnahme. Einstellungen werden automatisch gespeichert.");
-                ui.horizontal(|ui| { ui.label("Vorverstärkung"); ui.add(egui::Slider::new(&mut self.master_eq.preamp, -12.0..=12.0).suffix(" dB")); });
+                ui.label("Applies to the master, SHOUTcast stream and MP3 recording. Settings are saved automatically.");
+                ui.horizontal(|ui| { ui.label("Preamp"); ui.add(egui::Slider::new(&mut self.master_eq.preamp, -12.0..=12.0).suffix(" dB")); });
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         for (band, label) in equalizer::LABELS.into_iter().enumerate() {
@@ -746,48 +746,48 @@ impl RustDj {
         let recording_busy = self.broadcaster.recording_busy();
         let master_ready = self.audio.stream.is_some();
         let mut password_changed = false;
-        egui::Window::new("SHOUTcast / MP3-Aufnahme")
+        egui::Window::new("SHOUTcast / MP3 Recording")
             .open(&mut open).default_width(660.0).default_height(720.0)
             .default_pos(Pos2::new(200.0, 64.0))
             .max_height((ctx.content_rect().height() - 100.0).max(320.0))
             .resizable(true).vscroll(true).show(ctx, |ui| {
                 ui.label(RichText::new("MASTER → STREAM / MP3").strong().color(PURPLE));
-                ui.label("Gesendet und aufgenommen wird nur der Master, einschließlich Master-Level, EQ, Filtern und Effekten.");
-                ui.label(RichText::new(format!("Quelle: {} · Stereo · MP3 44,1 kHz", self.audio.master_name)).small().color(MUTED));
+                ui.label("Only the master is streamed and recorded, including master level, EQ, filters and effects.");
+                ui.label(RichText::new(format!("Source: {} · Stereo · MP3 44.1 kHz", self.audio.master_name)).small().color(MUTED));
                 ui.separator();
                 ui.add_enabled_ui(!stream_busy, |ui| {
                     ui.spacing_mut().text_edit_width = 360.0;
                     egui::Grid::new("shoutcast-config").num_columns(2).spacing([14.0, 7.0]).show(ui, |ui| {
-                        ui.label("Server / IP"); ui.text_edit_singleline(&mut self.stream_settings.host).on_hover_text("Hostname oder IP ohne http:// und ohne Pfad"); ui.end_row();
-                        ui.label("Source-Port"); ui.add(egui::DragValue::new(&mut self.stream_settings.source_port).range(1..=u16::MAX)); ui.end_row();
-                        ui.label("Metadata-/Admin-Port"); ui.add(egui::DragValue::new(&mut self.stream_settings.admin_port).range(1..=u16::MAX)); ui.end_row();
-                        ui.label("Stream-ID (DNAS 2)"); ui.add(egui::DragValue::new(&mut self.stream_settings.stream_id).range(1..=u32::MAX)); ui.end_row();
-                        ui.label("Source-Passwort"); password_changed = ui.add(egui::TextEdit::singleline(&mut self.stream_password).password(true)).on_hover_text("Wird mit Windows-Verschlüsselung für dein Benutzerkonto gespeichert und beim nächsten Start wieder geladen.").changed(); ui.end_row();
-                        ui.label("Stationsname"); ui.text_edit_singleline(&mut self.stream_settings.station); ui.end_row();
+                        ui.label("Server / IP"); ui.text_edit_singleline(&mut self.stream_settings.host).on_hover_text("Hostname or IP address without http:// or a path"); ui.end_row();
+                        ui.label("Source port"); ui.add(egui::DragValue::new(&mut self.stream_settings.source_port).range(1..=u16::MAX)); ui.end_row();
+                        ui.label("Metadata/admin port"); ui.add(egui::DragValue::new(&mut self.stream_settings.admin_port).range(1..=u16::MAX)); ui.end_row();
+                        ui.label("Stream ID (DNAS 2)"); ui.add(egui::DragValue::new(&mut self.stream_settings.stream_id).range(1..=u32::MAX)); ui.end_row();
+                        ui.label("Source password"); password_changed = ui.add(egui::TextEdit::singleline(&mut self.stream_password).password(true)).on_hover_text("Saved using Windows encryption for your user account and restored on the next startup.").changed(); ui.end_row();
+                        ui.label("Station name"); ui.text_edit_singleline(&mut self.stream_settings.station); ui.end_row();
                         ui.label("Genre (optional)"); ui.text_edit_singleline(&mut self.stream_settings.genre); ui.end_row();
-                        ui.label("Stations-URL (optional)"); ui.text_edit_singleline(&mut self.stream_settings.url); ui.end_row();
+                        ui.label("Station URL (optional)"); ui.text_edit_singleline(&mut self.stream_settings.url); ui.end_row();
                     });
                 });
                 if let Some(error) = &self.stream_password_error { ui.colored_label(WARNING, error); }
                 ui.horizontal(|ui| {
-                    ui.label("MP3-Bitrate für neue Starts");
+                    ui.label("MP3 bitrate for new sessions");
                     egui::ComboBox::from_id_salt("stream-bitrate").selected_text(format!("{} kbit/s", self.stream_settings.bitrate)).show_ui(ui, |ui| {
                         for bitrate in [128, 192, 256, 320] { ui.selectable_value(&mut self.stream_settings.bitrate, bitrate, format!("{bitrate} kbit/s")); }
                     });
                 });
-                ui.label(RichText::new("SHOUTcast-1-kompatible Source-Verbindung, auch DNAS 2 mit Stream-ID. Häufig: Source 8001, Metadata 8000; die Ports des Anbieters verwenden.").small().color(MUTED));
+                ui.label(RichText::new("SHOUTcast 1-compatible source connection, including DNAS 2 with a stream ID. Common ports: source 8001, metadata 8000; use your provider's settings.").small().color(MUTED));
                 ui.separator();
-                ui.checkbox(&mut self.stream_settings.send_tags, "Titel-Tags an den Server senden");
+                ui.checkbox(&mut self.stream_settings.send_tags, "Send track titles to the server");
                 ui.add_enabled_ui(self.stream_settings.send_tags, |ui| {
-                    ui.checkbox(&mut self.stream_settings.automatic_title, "Automatisch: Titel des auf dem Master lautesten laufenden Decks");
+                    ui.checkbox(&mut self.stream_settings.automatic_title, "Automatic: title of the playing deck with the highest master contribution");
                     if !self.stream_settings.automatic_title {
-                        ui.horizontal(|ui| { ui.label("Manueller Titel"); ui.text_edit_singleline(&mut self.stream_settings.manual_title); });
+                        ui.horizontal(|ui| { ui.label("Manual title"); ui.text_edit_singleline(&mut self.stream_settings.manual_title); });
                     }
                 });
                 ui.horizontal(|ui| {
                     if stream_busy {
-                        if ui.button("Stream stoppen").clicked() { self.broadcaster.stop_stream(); }
-                    } else if ui.add_enabled(master_ready, egui::Button::new("Stream starten").fill(PURPLE.gamma_multiply(0.5))).clicked()
+                        if ui.button("Stop stream").clicked() { self.broadcaster.stop_stream(); }
+                    } else if ui.add_enabled(master_ready, egui::Button::new("Start stream").fill(PURPLE.gamma_multiply(0.5))).clicked()
                         && let Err(error) = self.broadcaster.start_stream(self.audio.capture.clone(), self.stream_settings.clone(), self.stream_password.clone())
                     { self.broadcaster.stream_status.phase = Phase::Error; self.broadcaster.stream_status.message = error; }
                     let status = &self.broadcaster.stream_status;
@@ -796,21 +796,21 @@ impl RustDj {
                 if !self.broadcaster.stream_status.message.is_empty() { ui.label(&self.broadcaster.stream_status.message); }
                 if self.stream_settings.send_tags && let Some(error) = &self.broadcaster.stream_status.metadata_error { ui.colored_label(WARNING, error); }
                 ui.separator();
-                ui.label(RichText::new("MP3-AUFNAHME").strong().color(LIGHT_PURPLE));
+                ui.label(RichText::new("MP3 RECORDING").strong().color(LIGHT_PURPLE));
                 ui.add_enabled_ui(!recording_busy, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Ordner");
+                        ui.label("Folder");
                         let mut directory = self.stream_settings.recording_dir.to_string_lossy().into_owned();
                         if ui.text_edit_singleline(&mut directory).changed() { self.stream_settings.recording_dir = directory.into(); }
-                        if ui.button("Wählen …").clicked()
-                            && let Some(directory) = rfd::FileDialog::new().set_title("Ordner für MP3-Aufnahmen").pick_folder()
+                        if ui.button("Browse …").clicked()
+                            && let Some(directory) = rfd::FileDialog::new().set_title("MP3 recording folder").pick_folder()
                         { self.stream_settings.recording_dir = directory; }
                     });
                 });
                 ui.horizontal(|ui| {
                     if recording_busy {
-                        if ui.button("Aufnahme stoppen").clicked() { self.broadcaster.stop_recording(); }
-                    } else if ui.add_enabled(master_ready, egui::Button::new("MP3-Aufnahme starten")).clicked()
+                        if ui.button("Stop recording").clicked() { self.broadcaster.stop_recording(); }
+                    } else if ui.add_enabled(master_ready, egui::Button::new("Start MP3 recording")).clicked()
                         && let Err(error) = self.broadcaster.start_recording(self.audio.capture.clone(), &self.stream_settings)
                     { self.broadcaster.recording_status.phase = Phase::Error; self.broadcaster.recording_status.message = error; }
                     let status = &self.broadcaster.recording_status;
@@ -818,8 +818,8 @@ impl RustDj {
                 });
                 if !self.broadcaster.recording_status.message.is_empty() { ui.label(&self.broadcaster.recording_status.message); }
                 if let Some(path) = &self.broadcaster.recording_status.path { ui.label(RichText::new(path.display().to_string()).small()); }
-                ui.label(RichText::new("Stream und Aufnahme können unabhängig laufen. Neue MP3-Dateien werden eindeutig benannt. Stop schließt die Aufnahme ab. Zum Wechseln der Audioausgänge beide Vorgänge beenden.").small().color(MUTED));
-                if !master_ready { ui.colored_label(WARNING, "Zuerst einen verfügbaren Master-Ausgang unter Audio / Ausgänge auswählen."); }
+                ui.label(RichText::new("Streaming and recording can run independently. New MP3 files have unique names. Stop finalizes the recording. Stop both sessions before changing audio outputs.").small().color(MUTED));
+                if !master_ready { ui.colored_label(WARNING, "Select an available master output under Audio / Outputs first."); }
             });
         self.show_streamer = open;
         if password_changed {
@@ -848,9 +848,8 @@ impl RustDj {
 
     fn apply_audio(&mut self, routing: Routing) {
         if self.broadcaster.busy() {
-            self.notice = Some(
-                "Stream und Aufnahme zuerst beenden, um die Audioausgänge zu wechseln.".into(),
-            );
+            self.notice =
+                Some("Stop streaming and recording before changing audio outputs.".into());
             return;
         }
         match Audio::open(routing) {
@@ -868,12 +867,12 @@ impl RustDj {
                 self.routing_edit = self.audio.routing.clone();
                 self.audio_dirty = true;
                 self.notice = Some(if errors.is_empty() {
-                    "Audioausgänge übernommen; Abspielpositionen bleiben erhalten.".into()
+                    "Audio outputs applied; playback positions preserved.".into()
                 } else {
                     errors.join("; ")
                 });
             }
-            Err(error) => self.notice = Some(format!("Ausgänge nicht geändert: {error}")),
+            Err(error) => self.notice = Some(format!("Outputs were not changed: {error}")),
         }
     }
 
@@ -889,43 +888,43 @@ impl RustDj {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.device_scan = None;
-                    self.notice = Some("Audiogeräte konnten nicht aufgelistet werden.".into());
+                    self.notice = Some("Could not list audio devices.".into());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         let mut open = self.show_audio;
         let (mut apply, mut refresh) = (false, false);
-        egui::Window::new("Audio / Ausgänge").open(&mut open).default_width(680.0).resizable(true).show(ctx, |ui| {
-            ui.label("Master für Lautsprecher und Kopfhörer zum Vorhören getrennt auswählen.");
+        egui::Window::new("Audio / Outputs").open(&mut open).default_width(680.0).resizable(true).show(ctx, |ui| {
+            ui.label("Choose separate outputs for the master speakers and headphone monitoring.");
             ui.horizontal(|ui| {
-                if ui.button("Geräte aktualisieren").clicked() { refresh = true; }
-                if self.device_scan.is_some() { ui.spinner(); ui.label("Geräte werden gesucht …"); }
+                if ui.button("Refresh devices").clicked() { refresh = true; }
+                if self.device_scan.is_some() { ui.spinner(); ui.label("Searching for devices …"); }
             });
             ui.separator();
             ui.label(RichText::new("MASTER OUTPUT").strong().color(PURPLE));
             target_ui(ui, "master-device", &mut self.routing_edit.master, &self.audio_devices);
             ui.add_space(8.0);
-            ui.label(RichText::new("PHONES · AUSGABEQUELLE ZUM VORHÖREN").strong().color(LIGHT_PURPLE));
+            ui.label(RichText::new("PHONES · MONITORING OUTPUT").strong().color(LIGHT_PURPLE));
             let choice_width = ui.available_width().min(580.0);
             refresh |= phones_device_ui(ui, "phones-device", &mut self.routing_edit.phones, &self.audio_devices, choice_width);
             if let Some(target) = &mut self.routing_edit.phones {
                 channel_pair_ui(ui, "phones-device", target, &self.audio_devices, false);
             }
             ui.add_space(8.0);
-            ui.label("Zwei Geräte: jeweils Kanäle 1/2. Ein Mehrkanalgerät: z. B. Master 1/2 und Phones 3/4. Überlappende Kanalpaare sind gesperrt.");
-            ui.label(RichText::new("Bei Bluetooth und unterschiedlichen Soundkarten können die Geräte unterschiedliche Latenzen haben. Bei fehlenden Geräten wird kein anderer Ausgang als Ersatz verwendet.").small().color(MUTED));
+            ui.label("Two devices: channels 1/2 on each. One multichannel device: e.g. master 1/2 and phones 3/4. Overlapping channel pairs are blocked.");
+            ui.label(RichText::new("Bluetooth and different sound cards may have different latencies. Missing devices are not replaced with another output.").small().color(MUTED));
             ui.separator();
-            ui.label(format!("Aktiver Master: {} — Kanäle {}/{}", self.audio.master_name, self.audio.routing.master.pair * 2 + 1, self.audio.routing.master.pair * 2 + 2));
-            ui.label(format!("Aktive Phones: {}", self.audio.phones_name.as_deref().unwrap_or("Aus")));
+            ui.label(format!("Active master: {} — Channels {}/{}", self.audio.master_name, self.audio.routing.master.pair * 2 + 1, self.audio.routing.master.pair * 2 + 2));
+            ui.label(format!("Active phones: {}", self.audio.phones_name.as_deref().unwrap_or("Off")));
             if let Some(error) = &self.audio.error { ui.colored_label(WARNING, error); }
             ui.horizontal(|ui| {
-                if ui.button("Übernehmen").clicked() { apply = true; }
-                if ui.button("Auswahl zurücksetzen").clicked() { self.routing_edit = self.audio.routing.clone(); }
+                if ui.button("Apply").clicked() { apply = true; }
+                if ui.button("Reset selection").clicked() { self.routing_edit = self.audio.routing.clone(); }
             });
             if let Some(notice) = &self.notice { ui.label(RichText::new(notice).small().color(MUTED)); }
             ui.separator();
-            ui.label("Vorhören: PHONES CUE am Deck einschalten, MIXING nach Cue und PHONES LEVEL aufdrehen. Der Track muss laufen oder per Transport-CUE vorgehört werden.");
+            ui.label("Monitoring: enable the deck's PHONES CUE, turn MIXING toward Cue and raise HEADPHONES level. Play the track or hold transport CUE to preview it.");
         });
         self.show_audio = open;
         if refresh {
@@ -942,14 +941,14 @@ fn target_ui(ui: &mut egui::Ui, id: &str, target: &mut Target, devices: &[Device
     egui::ComboBox::from_id_salt(id)
         .width(ui.available_width().min(580.0))
         .wrap_mode(egui::TextWrapMode::Truncate)
-        .selected_text(target.device.as_deref().unwrap_or("Windows-Systemstandard"))
+        .selected_text(target.device.as_deref().unwrap_or("Windows system default"))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut target.device, None, "Windows-Systemstandard");
+            ui.selectable_value(&mut target.device, None, "Windows system default");
             for device in devices {
                 ui.selectable_value(
                     &mut target.device,
                     Some(device.name.clone()),
-                    format!("{} (bis {} Kanäle)", device.name, device.channels),
+                    format!("{} (up to {} channels)", device.name, device.channels),
                 );
             }
         });
@@ -971,8 +970,8 @@ fn phones_device_ui(
     let mut choice = target.as_ref().map(|target| target.device.clone());
     let old = choice.clone();
     let label = match &choice {
-        None => "Aus – kein Kopfhörerausgang",
-        Some(None) => "Windows-Systemstandard",
+        None => "Off – no headphone output",
+        Some(None) => "Windows system default",
         Some(Some(name)) => name,
     }
     .to_owned();
@@ -982,17 +981,17 @@ fn phones_device_ui(
         .wrap_mode(egui::TextWrapMode::Truncate)
         .selected_text(&label)
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut choice, None, "Aus – kein Kopfhörerausgang");
-            ui.selectable_value(&mut choice, Some(None), "Windows-Systemstandard");
+            ui.selectable_value(&mut choice, None, "Off – no headphone output");
+            ui.selectable_value(&mut choice, Some(None), "Windows system default");
             for device in devices {
                 ui.selectable_value(
                     &mut choice,
                     Some(Some(device.name.clone())),
-                    format!("{} (bis {} Kanäle)", device.name, device.channels),
+                    format!("{} (up to {} channels)", device.name, device.channels),
                 );
             }
             ui.separator();
-            if ui.button("Geräte aktualisieren …").clicked() {
+            if ui.button("Refresh devices …").clicked() {
                 refresh = true;
                 ui.close();
             }
@@ -1022,14 +1021,14 @@ fn channel_pair_ui(
         .selected_text(if compact {
             format!("{}/{}", target.pair * 2 + 1, target.pair * 2 + 2)
         } else {
-            format!("Kanäle {} / {}", target.pair * 2 + 1, target.pair * 2 + 2)
+            format!("Channels {} / {}", target.pair * 2 + 1, target.pair * 2 + 2)
         })
         .show_ui(ui, |ui| {
             for pair in 0..(channels / 2).clamp(1, 16) {
                 ui.selectable_value(
                     &mut target.pair,
                     pair,
-                    format!("Kanäle {} / {}", pair * 2 + 1, pair * 2 + 2),
+                    format!("Channels {} / {}", pair * 2 + 1, pair * 2 + 2),
                 );
             }
         });
@@ -1083,7 +1082,7 @@ impl eframe::App for RustDj {
             } else if let Some(notice) = &self.notice {
                 ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).truncate()).on_hover_text(notice);
             } else {
-                ui.label(RichText::new("1 / 2 / 3 / 4  Deck wählen     SPACE  Play/Pause     S  Sync     C  Cue     ESC  Stop     Links / Rechts  Crossfader").size(10.0).color(MUTED));
+                ui.label(RichText::new("1 / 2 / 3 / 4  Select deck     SPACE  Play/Pause     S  Sync     C  Cue     ESC  Stop     Left / Right  Crossfader").size(10.0).color(MUTED));
             }
         });
         egui::TopBottomPanel::top("waveforms")
@@ -1237,7 +1236,7 @@ impl eframe::App for RustDj {
                 } else if track::supported(&path) {
                     external_music.push(path);
                 } else {
-                    self.notice = Some("Bitte Musikdatei oder Ordner ablegen.".into());
+                    self.notice = Some("Drop a music file or folder here.".into());
                 }
             }
         }
@@ -1435,7 +1434,7 @@ fn deck_ui(
                     ui.label(RichText::new("PHONES").size(9.0).color(color));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Öffnen").clicked() {
+                    if ui.small_button("Open").clicked() {
                         response.open = true;
                     }
                 });
@@ -1443,7 +1442,7 @@ fn deck_ui(
             let title = deck
                 .track
                 .as_ref()
-                .map_or("Musik hier ablegen", |t| t.title.as_str());
+                .map_or("Drop music here", |t| t.title.as_str());
             ui.add(egui::Label::new(RichText::new(title).strong()).truncate())
                 .on_hover_text(title);
             let duration = deck.track.as_ref().map_or(Duration::ZERO, |t| t.duration);
@@ -1469,7 +1468,7 @@ fn deck_ui(
                         .size(15.0)
                         .color(color),
                 );
-                let bpm = deck.grid.map_or("BPM setzen".into(), |g| {
+                let bpm = deck.grid.map_or("Set BPM".into(), |g| {
                     format!("{:.1} BPM", g.bpm * deck.speed)
                 });
                 ui.menu_button(bpm, |ui| {
@@ -1488,11 +1487,11 @@ fn deck_ui(
                                 grid.bpm = (grid.bpm * 2.0).min(250.0);
                             }
                         });
-                        if ui.button("Beat hier setzen").clicked() {
+                        if ui.button("Set beat here").clicked() {
                             grid.offset = position.as_secs_f64().rem_euclid(grid.period());
                             ui.close();
                         }
-                    } else if ui.button("120 BPM setzen").clicked() {
+                    } else if ui.button("Set 120 BPM").clicked() {
                         deck.grid = Some(BeatGrid {
                             bpm: 120.0,
                             offset: 0.0,
@@ -1519,7 +1518,7 @@ fn deck_ui(
                 }
                 if ui
                     .small_button(format!("{percent:+.1}%"))
-                    .on_hover_text("Tempo zurücksetzen")
+                    .on_hover_text("Reset tempo")
                     .clicked()
                 {
                     deck.speed = 1.0;
@@ -1530,7 +1529,7 @@ fn deck_ui(
                 let available = deck.track.is_some() && audio.stream.is_some();
                 let cue = ui
                     .add_enabled(available, egui::Button::new("CUE"))
-                    .on_hover_text("Halten zum Vorhören. Rechtsklick: Cue-Punkt setzen.");
+                    .on_hover_text("Hold to preview. Right-click to set the cue point.");
                 if cue.secondary_clicked() {
                     deck.cue = position;
                 }
@@ -1614,9 +1613,7 @@ fn deck_ui(
                         deck.hotcue(slot, audio);
                         response.performance_changed = saved.is_some();
                     }
-                    button.on_hover_text(
-                        "Leer: setzen; belegt: springen. Shift/Rechtsklick: löschen.",
-                    );
+                    button.on_hover_text("Empty: set; assigned: jump. Shift/right-click: clear.");
                 }
             });
             ui.label(RichText::new("LOOPS · BEATS").size(9.0).color(MUTED));
@@ -1633,7 +1630,7 @@ fn deck_ui(
                                 .selected(selected)
                                 .min_size(Vec2::new(pad_width, 20.0)),
                         )
-                        .on_hover_text("Erneut drücken: Loop verlassen")
+                        .on_hover_text("Press again to exit the loop")
                         .clicked()
                     {
                         deck.beat_loop(beats, audio);
@@ -1642,7 +1639,7 @@ fn deck_ui(
                 }
             });
             if deck.loading() {
-                ui.label(RichText::new("Wird analysiert …").small().color(color));
+                ui.label(RichText::new("Analyzing …").small().color(color));
             } else if let Some(error) = &deck.error {
                 ui.add(egui::Label::new(RichText::new(error).small().color(WARNING)).truncate())
                     .on_hover_text(error);
@@ -1681,7 +1678,7 @@ fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
         if response.double_clicked() {
             *value = 0.0;
         }
-        response.on_hover_text("Ziehen oder Wert eingeben; Doppelklick setzt 0 dB.");
+        response.on_hover_text("Drag or enter a value; double-click to reset to 0 dB.");
         let center = rect.center();
         let angle = -std::f32::consts::FRAC_PI_2
             + if *value < 0.0 {
@@ -1716,7 +1713,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
         ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
         ui.label(RichText::new((index + 1).to_string()).strong().color(color));
         ui.columns(2, |columns| {
-            for (band, label) in [(2, "HÖHEN"), (1, "MITTEN"), (0, "TIEFEN")] {
+            for (band, label) in [(2, "HIGH"), (1, "MID"), (0, "LOW")] {
                 knob_ui(&mut columns[0], label, &mut deck.eq[band], color);
             }
             knob_ui(&mut columns[1], "GAIN", &mut deck.gain, color);
@@ -1740,7 +1737,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
                 );
                 if ui
                     .add(egui::Button::new("CUE").small().selected(deck.pfl))
-                    .on_hover_text("Kopfhörer-Vorhören vor Kanal-Fader und Crossfader")
+                    .on_hover_text("Headphone monitoring before the channel fader and crossfader")
                     .clicked()
                 {
                     deck.pfl = !deck.pfl;
@@ -1756,7 +1753,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
 
 fn strip_meter_ui(ui: &mut egui::Ui, level: f32, color: Color32) {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, 100.0), Sense::hover());
-    response.on_hover_text(format!("Kanalpegel: {}", peak_text(level)));
+    response.on_hover_text(format!("Channel level: {}", peak_text(level)));
     let db = peak_db(level);
     for segment in 0..30 {
         let threshold = -60.0 + segment as f32 / 29.0 * 66.0;
@@ -1864,7 +1861,7 @@ fn waveform_ui(
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "MUSIK HIER ABLEGEN",
+            "DROP MUSIC HERE",
             FontId::proportional(11.0),
             MUTED,
         );
@@ -1899,7 +1896,7 @@ fn fx_knob(
         if response.double_clicked() {
             *value = reset;
         }
-        response.on_hover_text("Ziehen zum Regeln; Doppelklick setzt die Grundstellung.");
+        response.on_hover_text("Drag to adjust; double-click to reset.");
         let angle = -std::f32::consts::FRAC_PI_2 + ((*value - min) / (max - min) * 2.0 - 1.0) * 2.3;
         ui.painter().circle_filled(rect.center(), 13.0, BG);
         ui.painter()
@@ -1939,10 +1936,10 @@ impl RustDj {
                 if ui.selectable_value(&mut self.mixer_outputs, true, "MASTER / PHONES").clicked() {
                     refresh_devices = true;
                 }
-                if ui.add(egui::Button::new("EQ").small().selected(self.master_eq.enabled)).on_hover_text("10-Band-Master-Equalizer").clicked() { self.show_equalizer = true; }
+                if ui.add(egui::Button::new("EQ").small().selected(self.master_eq.enabled)).on_hover_text("10-Band Master Equalizer").clicked() { self.show_equalizer = true; }
                 let active = self.broadcaster.busy();
                 let label = if self.broadcaster.recording_busy() { "STREAMER / REC" } else { "STREAMER" };
-                if ui.add(egui::Button::new(label).small().selected(active)).on_hover_text("SHOUTcast vom Master senden und MP3 aufnehmen").clicked() {
+                if ui.add(egui::Button::new(label).small().selected(active)).on_hover_text("Stream the master to SHOUTcast and record MP3").clicked() {
                     self.show_streamer = true;
                 }
             });
@@ -1959,9 +1956,9 @@ impl RustDj {
                         ui.add_space(52.0);
                     }
                     let pending = self.routing_edit.phones != self.audio.routing.phones;
-                    apply_phones = ui.add_enabled(pending || self.audio.error.is_some(), egui::Button::new("Setzen").small())
-                        .on_hover_text("Kopfhörer-Ausgabe übernehmen und speichern. Der Master-Ausgang bleibt unverändert.").clicked();
-                    show_audio = ui.small_button("…").on_hover_text("Alle Audioausgänge einstellen").clicked();
+                    apply_phones = ui.add_enabled(pending || self.audio.error.is_some(), egui::Button::new("Apply").small())
+                        .on_hover_text("Apply and save the headphone output. The master output stays unchanged.").clicked();
+                    show_audio = ui.small_button("…").on_hover_text("Configure all audio outputs").clicked();
                 });
                 ui.horizontal_top(|ui| {
                     stereo_meter_ui(ui, self.bus_levels[0], "MASTER", PURPLE);
@@ -2014,13 +2011,13 @@ impl RustDj {
                 if ui.add_enabled(
                     self.crossfader.enabled,
                     egui::Slider::new(&mut position, -1.0..=1.0).show_value(false),
-                ).on_hover_text("OFF: Mitte, MIDI- und Tastaturbewegungen gesperrt.").changed() {
+                ).on_hover_text("OFF: centered; MIDI and keyboard movements are ignored.").changed() {
                     self.crossfader.set_position(position);
                 }
                 ui.label(RichText::new("4/2").color(LIGHT_PURPLE));
             });
             if self.bus_levels.iter().flatten().any(|peak| *peak >= 1.0) {
-                ui.colored_label(WARNING, "CLIP · Ausgangspegel reduzieren");
+                ui.colored_label(WARNING, "CLIP · Reduce output level");
             }
         });
         if refresh_devices || show_audio {
@@ -2041,18 +2038,18 @@ impl RustDj {
     fn waveforms_ui(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.horizontal(|ui| {
-            for (band, label) in ["TIEFEN <250 Hz", "MITTEN", "HÖHEN >4 kHz"]
+            for (band, label) in ["LOW <250 Hz", "MID", "HIGH >4 kHz"]
                 .into_iter()
                 .enumerate()
             {
                 ui.label(RichText::new(label).size(10.0).color(BAND_COLOURS[band]));
             }
             ui.separator();
-            if ui.small_button("−").on_hover_text("Herauszoomen").clicked() {
+            if ui.small_button("−").on_hover_text("Zoom out").clicked() {
                 self.wave_window = (self.wave_window * 2.0).min(16.0);
             }
             ui.label(RichText::new(format!("{} s", self.wave_window)).small());
-            if ui.small_button("+").on_hover_text("Mehr Details").clicked() {
+            if ui.small_button("+").on_hover_text("More detail").clicked() {
                 self.wave_window = (self.wave_window / 2.0).max(1.0);
             }
         });
@@ -2158,7 +2155,7 @@ fn controller_status(port: Option<&str>, auto: bool) -> String {
         Some(port) => format!("CONTROLLER ON · {port}"),
         None => format!(
             "CONTROLLER OFF{}",
-            if auto { " · automatische Suche" } else { "" }
+            if auto { " · auto-detecting" } else { "" }
         ),
     }
 }
@@ -2197,19 +2194,19 @@ pub(crate) fn output_levels_ui(
                 "MASTER",
                 master,
                 PURPLE,
-                "Lautstärke des Masters, Streams und der Aufnahme",
+                "Volume of the master, stream and recording",
             ),
             (
                 "HEADPHONES",
                 phones,
                 LIGHT_PURPLE,
-                "Lautstärke des ausgewählten Kopfhörerausgangs",
+                "Volume of the selected headphone output",
             ),
             (
                 "CUE / MASTER",
                 mixing,
                 MUTED,
-                "Links: Vorhören (CUE), rechts: Master im Kopfhörer",
+                "Left: cue monitoring; right: master in headphones",
             ),
         ]) {
             column.vertical(|ui| {
@@ -2247,9 +2244,7 @@ fn meter_ui(ui: &mut egui::Ui, level: f32, color: Color32, label: &str, height: 
         ui.set_width(48.0);
         ui.label(RichText::new(label).strong().color(color));
         let (rect, response) = ui.allocate_exact_size(Vec2::new(48.0, height), Sense::hover());
-        response.on_hover_text(
-            "Digitaler Spitzenpegel in dBFS; ab 0 dBFS kann der Ausgang übersteuern.",
-        );
+        response.on_hover_text("Digital peak level in dBFS; levels at or above 0 dBFS may clip.");
         let painter = ui.painter();
         let db = peak_db(level);
         for i in 0..30 {

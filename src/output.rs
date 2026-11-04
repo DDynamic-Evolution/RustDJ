@@ -171,10 +171,10 @@ fn resolve(target: &Target) -> Result<(cpal::Device, String), String> {
             .output_devices()
             .map_err(|e| e.to_string())?
             .find(|d| d.name().is_ok_and(|n| &n == name))
-            .ok_or_else(|| format!("Audiogerät nicht gefunden: {name}"))?,
+            .ok_or_else(|| format!("Audio device not found: {name}"))?,
         None => host
             .default_output_device()
-            .ok_or("Kein Standard-Audioausgang verfügbar.")?,
+            .ok_or("No default audio output is available.")?,
     };
     let name = device.name().map_err(|e| e.to_string())?;
     Ok((device, name))
@@ -192,7 +192,7 @@ fn open(device: cpal::Device, required_channels: u16) -> Result<OutputStream, St
             .min_by_key(|c| c.channels())
             .ok_or_else(|| {
                 format!(
-                    "Gerät bietet kein Kanalpaar {}/{}.",
+                    "The device does not provide channel pair {}/{}.",
                     required_channels - 1,
                     required_channels
                 )
@@ -202,7 +202,7 @@ fn open(device: cpal::Device, required_channels: u16) -> Result<OutputStream, St
     }
     let mut stream = builder
         .open_stream()
-        .map_err(|e| format!("Audioausgang kann nicht geöffnet werden: {e}"))?;
+        .map_err(|e| format!("Could not open audio output: {e}"))?;
     stream.log_on_drop(false);
     Ok(stream)
 }
@@ -213,10 +213,10 @@ pub fn validate_pairs(
     phones_pair: Option<u16>,
 ) -> Result<(), String> {
     if master_pair > 15 || phones_pair.is_some_and(|pair| pair > 15) {
-        return Err("Ungültiges Kanalpaar.".into());
+        return Err("Invalid channel pair.".into());
     }
     if same_device && phones_pair == Some(master_pair) {
-        return Err("Master und Kopfhörer dürfen auf demselben Gerät nicht dasselbe Kanalpaar verwenden. Anderes Gerät oder z. B. Kanäle 3/4 wählen.".into());
+        return Err("Master and headphones cannot use the same channel pair on the same device. Choose another device or a different pair, such as channels 3/4.".into());
     }
     Ok(())
 }

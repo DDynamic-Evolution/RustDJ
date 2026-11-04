@@ -87,10 +87,10 @@ pub enum Event {
 }
 
 pub fn scan(path: &Path) -> Result<Vec<Entry>, String> {
-    let directory = std::fs::read_dir(path).map_err(|e| format!("Ordner nicht lesbar: {e}"))?;
+    let directory = std::fs::read_dir(path).map_err(|e| format!("Could not read folder: {e}"))?;
     let mut entries = Vec::new();
     for entry in directory {
-        let entry = entry.map_err(|e| format!("Verzeichniseintrag nicht lesbar: {e}"))?;
+        let entry = entry.map_err(|e| format!("Could not read directory entry: {e}"))?;
         let path = entry.path();
         let Ok(metadata) = entry.metadata() else {
             continue;
@@ -242,7 +242,7 @@ impl Browser {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.receiver = None;
-                    self.error = Some("Ordnersuche wurde beendet.".into());
+                    self.error = Some("Folder scan stopped unexpectedly.".into());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -382,11 +382,11 @@ impl Browser {
                 }
                 analysis::Event::Finished { cancelled } => {
                     self.analysis_notice = Some(format!(
-                        "{}: {} / {} Dateien, {} aus Datenbank, {} Fehler",
+                        "{}: {} / {} files, {} from database, {} errors",
                         if cancelled {
-                            "Abgebrochen"
+                            "Cancelled"
                         } else {
-                            "Analyse fertig"
+                            "Analysis complete"
                         },
                         job.completed,
                         job.total,
@@ -453,24 +453,24 @@ impl Browser {
             if ui
                 .add_enabled(
                     self.settings.folder.parent().is_some(),
-                    egui::Button::new("Hoch"),
+                    egui::Button::new("Up"),
                 )
                 .clicked()
             {
                 navigation = self.settings.folder.parent().map(Path::to_path_buf);
             }
-            if ui.button("Ordner …").clicked() {
+            if ui.button("Folder …").clicked() {
                 navigation = rfd::FileDialog::new()
                     .set_directory(&self.settings.folder)
                     .pick_folder();
             }
-            if ui.button("Neu laden").clicked() {
+            if ui.button("Refresh").clicked() {
                 navigation = Some(self.settings.folder.clone());
             }
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Musik / Ordner suchen …")
+                        .hint_text("Search music / folders …")
                         .desired_width(220.0),
                 )
                 .changed()
@@ -496,7 +496,7 @@ impl Browser {
                                     .color(crate::decks::COLORS[deck]),
                             ),
                         )
-                        .on_hover_text(format!("Auf Deck {} laden", deck + 1))
+                        .on_hover_text(format!("Load into Deck {}", deck + 1))
                         .clicked()
                     {
                         event = self.selected_path().map(|p| Event::Load(deck, p));
@@ -512,10 +512,10 @@ impl Browser {
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 navigation = Some(PathBuf::from(&self.path_edit));
             }
-            if ui.button("Gehe zu").clicked() {
+            if ui.button("Go").clicked() {
                 navigation = Some(PathBuf::from(&self.path_edit));
             }
-            if ui.small_button("Favorit +").clicked()
+            if ui.small_button("Favorite +").clicked()
                 && !self.settings.favorites.contains(&self.settings.folder)
             {
                 self.settings.favorites.push(self.settings.folder.clone());
@@ -524,15 +524,44 @@ impl Browser {
         });
         ui.horizontal(|ui| {
             let selected = self.selected_path();
-            let ready = selected.as_ref().is_some_and(|path| self.entries.iter().any(|e| &e.path == path && e.analysis.is_some()));
-            if ui.add_enabled(self.job.is_none() && selected.is_some(), egui::Button::new(if ready { "Auswahl erneut analysieren" } else { "Auswahl analysieren" })).clicked() {
+            let ready = selected.as_ref().is_some_and(|path| {
+                self.entries
+                    .iter()
+                    .any(|e| &e.path == path && e.analysis.is_some())
+            });
+            if ui
+                .add_enabled(
+                    self.job.is_none() && selected.is_some(),
+                    egui::Button::new(if ready {
+                        "Reanalyze selection"
+                    } else {
+                        "Analyze selection"
+                    }),
+                )
+                .clicked()
+            {
                 self.start_analysis(vec![selected.unwrap()], ready, ctx);
             }
-            let missing: Vec<_> = self.entries.iter().filter(|e| !e.directory && e.analysis.is_none()).map(|e| e.path.clone()).collect();
-            if ui.add_enabled(self.job.is_none() && !missing.is_empty(), egui::Button::new(format!("Unanalysierte analysieren ({})", missing.len()))).on_hover_text("Alle noch nicht oder nicht mehr aktuell analysierten Dateien im aktuellen Ordner; ohne Unterordner").clicked() {
+            let missing: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|e| !e.directory && e.analysis.is_none())
+                .map(|e| e.path.clone())
+                .collect();
+            if ui
+                .add_enabled(
+                    self.job.is_none() && !missing.is_empty(),
+                    egui::Button::new(format!("Analyze missing ({})", missing.len())),
+                )
+                .on_hover_text(
+                    "Analyze new or changed files in the current folder; excludes subfolders",
+                )
+                .clicked()
+            {
                 self.start_analysis(missing, false, ctx);
             }
-            ui.label(RichText::new("SQLite-Datenbank").small().weak()).on_hover_text(self.database.display().to_string());
+            ui.label(RichText::new("SQLite database").small().weak())
+                .on_hover_text(self.database.display().to_string());
         });
         if let Some(job) = &self.job {
             ui.horizontal(|ui| {
@@ -541,13 +570,13 @@ impl Browser {
                         .desired_width(160.0)
                         .text(format!("{} / {}", job.completed, job.total)),
                 );
-                if ui.button("Abbrechen").clicked() {
+                if ui.button("Cancel").clicked() {
                     job.cancel();
                 }
                 let status = if job.cancelling() {
-                    "Wird abgebrochen …".into()
+                    "Cancelling …".into()
                 } else {
-                    job.current.as_ref().map_or("Wartet …".into(), |p| {
+                    job.current.as_ref().map_or("Waiting …".into(), |p| {
                         p.file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
@@ -578,7 +607,7 @@ impl Browser {
                         .id_salt("folders")
                         .max_height(height)
                         .show(ui, |ui| {
-                            ui.label(RichText::new("FAVORITEN").small().strong());
+                            ui.label(RichText::new("FAVORITES").small().strong());
                             let mut remove = None;
                             for (index, folder) in self.settings.favorites.iter().enumerate() {
                                 ui.horizontal(|ui| {
@@ -608,14 +637,14 @@ impl Browser {
                                 self.dirty = true;
                             }
                             ui.separator();
-                            ui.label(RichText::new("LAUFWERKE").small().strong());
+                            ui.label(RichText::new("DRIVES").small().strong());
                             for root in &self.drives {
                                 if ui.small_button(root.display().to_string()).clicked() {
                                     navigation = Some(root.clone());
                                 }
                             }
                             ui.separator();
-                            ui.label(RichText::new("ORDNER").small().strong());
+                            ui.label(RichText::new("FOLDERS").small().strong());
                             let ancestors: Vec<_> = self.settings.folder.ancestors().collect();
                             for (depth, folder) in ancestors.into_iter().rev().enumerate() {
                                 let name = folder
@@ -654,26 +683,26 @@ impl Browser {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let mut sort = None;
-                    if ui.add_sized([(ui.available_width() - 432.0).max(80.0), 18.0], egui::Button::new("TITEL / DATEINAME").frame(false)).clicked() { sort = Some(Sort::Name); }
-                    for (label, width, key) in [("LÄNGE", 58.0, Sort::Duration), ("BPM", 55.0, Sort::Bpm), ("KEY", 100.0, Sort::Key)] {
+                    if ui.add_sized([(ui.available_width() - 432.0).max(80.0), 18.0], egui::Button::new("TITLE / FILENAME").frame(false)).clicked() { sort = Some(Sort::Name); }
+                    for (label, width, key) in [("LENGTH", 58.0, Sort::Duration), ("BPM", 55.0, Sort::Bpm), ("KEY", 100.0, Sort::Key)] {
                         if ui.add_sized([width, 18.0], egui::Button::new(label).frame(false)).clicked() { sort = Some(key); }
                     }
-                    ui.add_sized([78.0, 18.0], egui::Label::new(RichText::new("ANALYSE").small()));
+                    ui.add_sized([78.0, 18.0], egui::Label::new(RichText::new("ANALYSIS").small()));
                     ui.add_sized([48.0, 18.0], egui::Label::new(RichText::new("FORMAT").small()));
-                    ui.add_sized([57.0, 18.0], egui::Label::new(RichText::new("GRÖSSE").small()));
+                    ui.add_sized([57.0, 18.0], egui::Label::new(RichText::new("SIZE").small()));
                     if let Some(sort) = sort { if self.sort == sort { self.descending = !self.descending; } else { self.sort = sort; self.descending = false; } self.refilter(); }
                 });
                 if self.receiver.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Ordner wird gelesen …");
+                        ui.label("Reading folder …");
                     });
                 }
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
                 if self.filtered.is_empty() && self.receiver.is_none() && self.error.is_none() {
-                    ui.label("Keine passenden Musikdateien oder Ordner.");
+                    ui.label("No matching music files or folders.");
                 }
                 let mut activate = false;
                 let mut scroll = egui::ScrollArea::vertical()
@@ -693,7 +722,7 @@ impl Browser {
                         let entry = &self.entries[self.filtered[row]];
                         let row_response = ui.horizontal(|ui| {
                             let name = if entry.directory {
-                                format!("[Ordner]  {}", entry.name)
+                                format!("[Folder]  {}", entry.name)
                             } else {
                                 entry.name.clone()
                             };
@@ -729,9 +758,9 @@ impl Browser {
                             ui.add_sized([58.0, 27.0], egui::Label::new(duration));
                             ui.add_sized([55.0, 27.0], egui::Label::new(bpm));
                             ui.add_sized([100.0, 27.0], egui::Label::new(key.map_or("—".into(), |k| k.label())))
-                                .on_hover_text(key.map_or("Keine belastbare Tonart erkannt oder noch nicht analysiert.".into(), |k| format!("Geschätzte Tonart: {}. Profil-Übereinstimmung {:.0} %; keine Garantie.", k.label(), k.confidence * 100.0)));
+                                .on_hover_text(key.map_or("No reliable key detected, or the file has not been analyzed yet.".into(), |k| format!("Estimated key: {}. Profile match {:.0}%; not guaranteed.", k.label(), k.confidence * 100.0)));
                             let working = self.job.as_ref().is_some_and(|job| job.current.as_ref() == Some(&entry.path));
-                            let state = if entry.directory { "" } else if working { "Analyse …" } else if self.queued.contains(&entry.path) { "Wartet" } else if entry.analysis_error.is_some() { "Fehler" } else if summary.is_some() { "Analysiert" } else if entry.stale { "Geändert" } else { "Offen" };
+                            let state = if entry.directory { "" } else if working { "Analyzing …" } else if self.queued.contains(&entry.path) { "Queued" } else if entry.analysis_error.is_some() { "Error" } else if summary.is_some() { "Analyzed" } else if entry.stale { "Changed" } else { "Pending" };
                             ui.add_sized([78.0, 27.0], egui::Label::new(RichText::new(state).small().color(if entry.analysis_error.is_some() { egui::Color32::LIGHT_RED } else { ui.visuals().weak_text_color() }))).on_hover_text(entry.analysis_error.as_deref().unwrap_or(state));
                             ui.add_sized([48.0, 27.0], egui::Label::new(if entry.directory { "DIR".into() } else { entry.path.extension().unwrap_or_default().to_string_lossy().to_uppercase() }));
                             ui.add_sized([57.0, 27.0], egui::Label::new(if entry.directory { "".into() } else { format!("{:.1} MB", entry.bytes as f64 / 1_000_000.0) }));

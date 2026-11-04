@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "rustdj"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "eframe",
  "flate2",

@@ -168,11 +168,11 @@ pub fn sync_plan(
         || master.bpm <= 0.0
         || master_speed <= 0.0
     {
-        return Err("Für Sync sind gültige BPM auf beiden Decks erforderlich.".into());
+        return Err("Sync requires valid BPM values on both decks.".into());
     }
     let speed = master.bpm * master_speed / follower.bpm;
     if !(0.5..=2.0).contains(&speed) {
-        return Err("Sync würde den Tempobereich von 50–200 % überschreiten. BPM prüfen.".into());
+        return Err("Sync would exceed the 50–200% tempo range. Check the BPM values.".into());
     }
     let phase_delta =
         (master.phase(master_position) - follower.phase(position) + 0.5).rem_euclid(1.0) - 0.5;

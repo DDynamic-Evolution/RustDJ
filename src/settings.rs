@@ -56,13 +56,13 @@ pub(crate) fn load_from(path: &Path) -> (Settings, Option<String>) {
             Ok(settings) => (settings, None),
             Err(error) => (
                 Settings::default(),
-                Some(format!("Einstellungen nicht lesbar: {error}")),
+                Some(format!("Could not read settings: {error}")),
             ),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
         Err(error) => (
             Settings::default(),
-            Some(format!("Einstellungen nicht lesbar: {error}")),
+            Some(format!("Could not read settings: {error}")),
         ),
     }
 }
@@ -72,10 +72,10 @@ pub fn save(settings: &Settings) -> Result<(), String> {
 }
 
 pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
-    let parent = path.parent().ok_or("Kein Einstellungsordner")?;
+    let parent = path.parent().ok_or("No settings folder")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(temporary, path).map_err(|e| format!("Einstellungen nicht gespeichert: {e}"))
+    std::fs::rename(temporary, path).map_err(|e| format!("Settings were not saved: {e}"))
 }

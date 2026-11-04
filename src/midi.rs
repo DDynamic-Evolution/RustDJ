@@ -10,11 +10,10 @@ use std::{
 /// The DJ-202 starts with split pad layers. Unlock all eight pads before
 /// requesting its current positions/mode (see the controller author's mapping).
 fn initialize_dj202(mut send: impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
-    send(&[0xf0, 0x00, 0x20, 0x7f, 0x01, 0xf7]).map_err(|error| {
-        format!("DJ-202-Pad-Ebenen konnten nicht freigeschaltet werden: {error}")
-    })?;
+    send(&[0xf0, 0x00, 0x20, 0x7f, 0x01, 0xf7])
+        .map_err(|error| format!("Could not unlock DJ-202 pad layers: {error}"))?;
     send(&[0xf0, 0x00, 0x20, 0x7f, 0x00, 0xf7])
-        .map_err(|error| format!("Controller-Status konnte nicht angefordert werden: {error}"))
+        .map_err(|error| format!("Could not request controller status: {error}"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,14 +28,14 @@ impl PadMode {
         match self {
             Self::Hotcue => "HOT CUE",
             Self::Loop => "LOOP",
-            Self::Other(0x01) => "CUE LOOP (HOT CUE wählen)",
-            Self::Other(0x02) => "PITCH PLAY (HOT CUE wählen)",
-            Self::Other(0x03) => "SPLIT HOT CUE (HOT CUE wählen)",
-            Self::Other(0x11 | 0x13) => "ROLL (LOOP wählen)",
-            Self::Other(0x12) => "MANUAL LOOP (LOOP wählen)",
-            Self::Other(0x20..=0x22) => "SEQUENCER (HOT CUE/LOOP wählen)",
-            Self::Other(0x30..=0x33) => "SAMPLER/SLICER (HOT CUE/LOOP wählen)",
-            Self::Other(_) => "Anderer Modus (HOT CUE/LOOP wählen)",
+            Self::Other(0x01) => "CUE LOOP (select HOT CUE)",
+            Self::Other(0x02) => "PITCH PLAY (select HOT CUE)",
+            Self::Other(0x03) => "SPLIT HOT CUE (select HOT CUE)",
+            Self::Other(0x11 | 0x13) => "ROLL (select LOOP)",
+            Self::Other(0x12) => "MANUAL LOOP (select LOOP)",
+            Self::Other(0x20..=0x22) => "SEQUENCER (select HOT CUE/LOOP)",
+            Self::Other(0x30..=0x33) => "SAMPLER/SLICER (select HOT CUE/LOOP)",
+            Self::Other(_) => "Other mode (select HOT CUE/LOOP)",
         }
     }
 }
@@ -134,12 +133,12 @@ impl Action {
         match self {
             Self::DeckLayer(side) => {
                 return if side == 0 {
-                    "Controller: Deck 1/3 umschalten".into()
+                    "Controller: switch Deck 1/3".into()
                 } else {
-                    "Controller: Deck 2/4 umschalten".into()
+                    "Controller: switch Deck 2/4".into()
                 };
             }
-            Self::SelectDeck(d) => return format!("Deck {} auswählen", d + 1),
+            Self::SelectDeck(d) => return format!("Select Deck {}", d + 1),
             Self::FxToggle(d, slot) => {
                 return format!("{}: FX {}", d + 1, slot.saturating_add(1));
             }
@@ -154,7 +153,7 @@ impl Action {
                 return format!("{}: Hotcue {}", d + 1, slot + 1);
             }
             Self::ClearHotcue(d, slot) => {
-                return format!("{}: Hotcue {} löschen", d + 1, slot + 1);
+                return format!("{}: Clear hotcue {}", d + 1, slot + 1);
             }
             Self::LoopPreset(d, beats) => {
                 return format!("{}: {beats}-Beat-Loop", d + 1);
@@ -165,29 +164,29 @@ impl Action {
             Self::SelectDeck(_) | Self::DeckLayer(_) => unreachable!(),
             Self::Play(d) => ("Play/Pause", Some(d)),
             Self::Cue(d) => ("Cue", Some(d)),
-            Self::SetCue(d) => ("Cue setzen", Some(d)),
+            Self::SetCue(d) => ("Set cue", Some(d)),
             Self::Stop(d) => ("Stop", Some(d)),
             Self::Sync(d) => ("Sync", Some(d)),
             Self::Volume(d) => ("Level", Some(d)),
             Self::Tempo(d) => ("Tempo", Some(d)),
-            Self::Jog(d) => ("Jog / Suchen", Some(d)),
-            Self::Load(d) => ("Track laden", Some(d)),
-            Self::Pfl(d) => ("Kopfhörer CUE", Some(d)),
-            Self::EqLow(d) => ("Tiefen", Some(d)),
-            Self::EqMid(d) => ("Mitten", Some(d)),
-            Self::EqHigh(d) => ("Höhen", Some(d)),
+            Self::Jog(d) => ("Jog / Seek", Some(d)),
+            Self::Load(d) => ("Load track", Some(d)),
+            Self::Pfl(d) => ("Headphone CUE", Some(d)),
+            Self::EqLow(d) => ("Low", Some(d)),
+            Self::EqMid(d) => ("Mid", Some(d)),
+            Self::EqHigh(d) => ("High", Some(d)),
             Self::Gain(d) => ("Gain / Trim", Some(d)),
             Self::Filter(d) => ("Filter LP / HP", Some(d)),
             Self::FxLevel(d) => ("FX Level", Some(d)),
             Self::FxToggle(..) => unreachable!(),
-            Self::CrossfaderToggle => ("Crossfader ein/aus", None),
-            Self::LoopToggle(d) => ("Loop ein/aus", Some(d)),
+            Self::CrossfaderToggle => ("Toggle crossfader", None),
+            Self::LoopToggle(d) => ("Toggle loop", Some(d)),
             Self::LoopIn(d) => ("Loop IN", Some(d)),
             Self::LoopOut(d) => ("Loop OUT", Some(d)),
-            Self::LoopExit(d) => ("Loop verlassen", Some(d)),
+            Self::LoopExit(d) => ("Exit loop", Some(d)),
             Self::Reloop(d) => ("Reloop", Some(d)),
-            Self::LoopHalf(d) => ("Loop halbieren", Some(d)),
-            Self::LoopDouble(d) => ("Loop verdoppeln", Some(d)),
+            Self::LoopHalf(d) => ("Halve loop", Some(d)),
+            Self::LoopDouble(d) => ("Double loop", Some(d)),
             Self::Hotcue(..) | Self::ClearHotcue(..) | Self::LoopPreset(..) | Self::LoopPad(..) => {
                 unreachable!()
             }
@@ -195,8 +194,8 @@ impl Action {
             Self::Master => ("Master Level", None),
             Self::PhonesLevel => ("Phones Level", None),
             Self::PhonesMix => ("Mixing: Cue / Master", None),
-            Self::Browse => ("Browser-Auswahl", None),
-            Self::Open => ("Browser öffnen/laden", None),
+            Self::Browse => ("Browse selection", None),
+            Self::Open => ("Browse open/load", None),
         };
         match deck {
             Some(d) => format!("{}: {name}", d + 1),
@@ -849,12 +848,12 @@ impl Midi {
                                 })
                                 .unwrap_or(0);
                         }
-                        Err(error) => self.error = Some(format!("MIDI-Gerätesuche: {error}")),
+                        Err(error) => self.error = Some(format!("MIDI device scan: {error}")),
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.port_scan = None;
-                    self.error = Some("MIDI-Gerätesuche beendet.".into());
+                    self.error = Some("MIDI device scan stopped unexpectedly.".into());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -884,10 +883,10 @@ impl Midi {
             let ports = input.ports();
             let port = ports
                 .get(self.selected_port)
-                .ok_or("MIDI-Port nicht mehr vorhanden. Liste aktualisieren.")?;
+                .ok_or("The MIDI port is no longer available. Refresh the list.")?;
             let name = input.port_name(port).map_err(|e| e.to_string())?;
             if self.ports.get(self.selected_port) != Some(&name) {
-                return Err("MIDI-Portliste hat sich geändert. Bitte aktualisieren.".into());
+                return Err("The MIDI port list changed. Please refresh it.".into());
             }
             let (sender, receiver) = mpsc::sync_channel(512);
             let ctx = ctx.clone();
@@ -904,7 +903,7 @@ impl Midi {
                         },
                         (),
                     )
-                    .map_err(|e| format!("MIDI-Port kann nicht geöffnet werden: {e}"))?,
+                    .map_err(|e| format!("Could not open MIDI port: {e}"))?,
             );
             self.receiver = Some(receiver);
             // The output is also needed to unlock the pad layers, even with LEDs off.
@@ -921,7 +920,7 @@ impl Midi {
                                 .iter()
                                 .find(|p| output.port_name(p).is_ok_and(|n| is_dj202(&n)))
                         })
-                        .ok_or("DJ-202-MIDI-Ausgang fehlt")?;
+                        .ok_or("DJ-202 MIDI output is missing")?;
                     let mut connection = output
                         .connect(port, "RustDJ LEDs")
                         .map_err(|e| e.to_string())?;
@@ -934,7 +933,7 @@ impl Midi {
                     Ok(connection) => self.output = Some(connection),
                     Err(error) => {
                         self.error = Some(format!(
-                            "MIDI-Eingang verbunden; Pad-Freischaltung/LED-Ausgabe nicht bereit: {error}"
+                            "MIDI input connected; pad unlock/LED output unavailable: {error}"
                         ))
                     }
                 }
@@ -1018,7 +1017,7 @@ impl Midi {
         if let Some(output) = &mut self.output {
             for message in all_led_messages(decks, synced, self.mapper.layers) {
                 if let Err(error) = output.send(&message) {
-                    self.error = Some(format!("LED-Ausgabe fehlgeschlagen: {error}"));
+                    self.error = Some(format!("LED output failed: {error}"));
                     return;
                 }
             }
@@ -1310,7 +1309,7 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(attempts, 1);
-        assert!(error.contains("Pad-Ebenen"));
+        assert!(error.contains("pad layers"));
 
         let mut midi = Midi::unconnected(None, MidiPrefs::default());
         midi.connected = Some("Roland DJ-202".into());
@@ -1334,7 +1333,7 @@ mod tests {
             midi.pad_modes[0]
                 .unwrap()
                 .label()
-                .contains("HOT CUE/LOOP wählen")
+                .contains("select HOT CUE/LOOP")
         );
         assert_eq!(pad_mode_message([0x96, 0, 0]), Some((2, PadMode::Hotcue)));
         assert!(pad_mode_message([0x94, 0, 128]).is_none());

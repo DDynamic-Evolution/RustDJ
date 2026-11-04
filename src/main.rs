@@ -8,7 +8,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "RustDJ 0.18",
+        "RustDJ 0.19",
         options,
         Box::new(|cc| Ok(Box::new(rustdj::app::RustDj::new(cc)))),
     )

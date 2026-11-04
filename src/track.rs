@@ -32,8 +32,8 @@ pub struct Track {
 }
 
 pub fn open_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
-    let file = File::open(path).map_err(|e| format!("Datei nicht lesbar: {e}"))?;
-    Decoder::try_from(file).map_err(|e| format!("Audioformat nicht lesbar: {e}"))
+    let file = File::open(path).map_err(|e| format!("Could not read file: {e}"))?;
+    Decoder::try_from(file).map_err(|e| format!("Could not decode audio format: {e}"))
 }
 
 pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
@@ -41,7 +41,7 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     let sample_rate = decoder.sample_rate();
     let channels = decoder.channels();
     if sample_rate == 0 || channels == 0 {
-        return Err("Ungültige Audio-Abtastrate oder Kanalzahl.".into());
+        return Err("Invalid audio sample rate or channel count.".into());
     }
     let mut key_analysis = KeyAnalyzer::new(
         sample_rate,
@@ -59,7 +59,7 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     for sample in decoder {
         detailed.push(sample);
         if count.is_multiple_of(4096) && cancelled.load(Ordering::Relaxed) {
-            return Err("Laden abgebrochen.".into());
+            return Err("Loading cancelled.".into());
         }
         peak = peak.max(sample.abs().min(1.0));
         energy_sum += (sample as f64).powi(2);
@@ -79,7 +79,7 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
         }
     }
     if count == 0 {
-        return Err("Die Datei enthält keine dekodierbaren Audiodaten.".into());
+        return Err("The file contains no decodable audio data.".into());
     }
     if !count.is_multiple_of(bucket_samples as u64) {
         peaks.push(peak);
@@ -93,7 +93,7 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     let step = bucket_samples as f64 / channels as f64 / sample_rate as f64;
     let grid = beat::detect(&energies, step);
     if cancelled.load(Ordering::Relaxed) {
-        return Err("Laden abgebrochen.".into());
+        return Err("Loading cancelled.".into());
     }
     let key = key_analysis.finish();
     Ok(Track {

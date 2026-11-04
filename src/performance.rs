@@ -33,7 +33,7 @@ impl Store {
             for snapshot in receiver {
                 let result = (|| {
                     if Fingerprint::read(&snapshot.path)? != snapshot.identity {
-                        return Err("Hotcues nicht gespeichert: Musikdatei wurde geändert.".into());
+                        return Err("Hotcues were not saved: the music file changed.".into());
                     }
                     if db.is_none() {
                         db = Some(Database::open(&path)?);

@@ -20,7 +20,7 @@ pub fn cached(
     force: bool,
 ) -> Result<Track, String> {
     if cancelled.load(Ordering::Relaxed) {
-        return Err("Analyse abgebrochen.".into());
+        return Err("Analysis cancelled.".into());
     }
     let before = Fingerprint::read(&path)?;
     if !force
@@ -31,10 +31,10 @@ pub fn cached(
     }
     let track = track::analyze(path.clone(), cancelled)?;
     if cancelled.load(Ordering::Relaxed) {
-        return Err("Analyse abgebrochen.".into());
+        return Err("Analysis cancelled.".into());
     }
     if Fingerprint::read(&path)? != before {
-        return Err("Datei wurde während der Analyse geändert. Bitte erneut analysieren.".into());
+        return Err("The file changed during analysis. Please analyze it again.".into());
     }
     db.save(&track, &before)?;
     Ok(track)
@@ -60,17 +60,17 @@ pub fn load(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     }
     let mut track = track::analyze(path.clone(), cancelled)?;
     if cancelled.load(Ordering::Relaxed) {
-        return Err("Analyse abgebrochen.".into());
+        return Err("Analysis cancelled.".into());
     }
     if Fingerprint::read(&path)? != before {
-        return Err("Datei wurde während der Analyse geändert.".into());
+        return Err("The file changed during analysis.".into());
     }
     if let Some(db) = &db
         && let Err(error) = db.save(&track, &before)
     {
         warning = Some(error);
     }
-    track.cache_warning = warning.map(|e| format!("Analyse nicht in Datenbank gespeichert: {e}"));
+    track.cache_warning = warning.map(|e| format!("Analysis was not saved to the database: {e}"));
     Ok(track)
 }
 

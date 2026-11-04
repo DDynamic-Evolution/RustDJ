@@ -32,13 +32,13 @@ pub struct Range {
 impl Range {
     pub fn validate(self, duration: Duration) -> Result<Self, String> {
         if self.end <= self.start || self.end - self.start < Duration::from_millis(10) {
-            return Err("Loop OUT muss mindestens 10 ms nach IN liegen.".into());
+            return Err("Loop OUT must be at least 10 ms after IN.".into());
         }
         if self.end > duration {
-            return Err("Der Loop reicht über das Trackende hinaus.".into());
+            return Err("The loop extends beyond the end of the track.".into());
         }
         if self.end - self.start > Duration::from_secs(120) {
-            return Err("Manuelle Loops dürfen höchstens 120 Sekunden lang sein.".into());
+            return Err("Manual loops cannot exceed 120 seconds.".into());
         }
         Ok(self)
     }
@@ -56,7 +56,7 @@ impl Range {
             || !(0.125..=32.0).contains(&beats)
         {
             return Err(
-                "Für Beat-Loops gültige BPM und eine Länge von 1/8 bis 32 Beats wählen.".into(),
+                "Beat loops require a valid BPM value and a length from 1/8 to 32 beats.".into(),
             );
         }
         let period = grid.period();
@@ -95,34 +95,34 @@ pub struct Buffer {
 impl Buffer {
     pub fn prepare(path: &Path, range: Range, cancelled: &AtomicBool) -> Result<Arc<Self>, String> {
         if cancelled.load(Ordering::Relaxed) {
-            return Err("Loop-Vorbereitung abgebrochen.".into());
+            return Err("Loop preparation cancelled.".into());
         }
         let mut decoder = track::open_decoder(path)?;
         let rate = decoder.sample_rate();
         let channels = decoder.channels();
         if rate == 0 || channels == 0 {
-            return Err("Ungültiges Loop-Audioformat.".into());
+            return Err("Invalid loop audio format.".into());
         }
         let start = (range.start.as_secs_f64() * rate as f64).round() as u64 * channels as u64;
         let end = (range.end.as_secs_f64() * rate as f64).round() as u64 * channels as u64;
         let count = end.saturating_sub(start);
         if count == 0 || count > 16_000_000 {
-            return Err("Loop ist leer oder benötigt mehr als 64 MB Audiospeicher.".into());
+            return Err("The loop is empty or needs more than 64 MB of audio memory.".into());
         }
         decoder
             .try_seek(Duration::from_secs_f64(
                 start as f64 / rate as f64 / channels as f64,
             ))
-            .map_err(|e| format!("Loop IN nicht erreichbar: {e}"))?;
+            .map_err(|e| format!("Could not reach Loop IN: {e}"))?;
         let mut samples = Vec::with_capacity(count as usize);
         for sample in decoder.take(count as usize) {
             if samples.len().is_multiple_of(4096) && cancelled.load(Ordering::Relaxed) {
-                return Err("Loop-Vorbereitung abgebrochen.".into());
+                return Err("Loop preparation cancelled.".into());
             }
             samples.push(sample);
         }
         if samples.len() != count as usize {
-            return Err("Loop OUT liegt hinter den dekodierbaren Audiodaten.".into());
+            return Err("Loop OUT is beyond the decodable audio data.".into());
         }
         let range = Range {
             start: Duration::from_secs_f64(start as f64 / rate as f64 / channels as f64),

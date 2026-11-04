@@ -54,7 +54,7 @@ impl Default for StreamSettings {
             send_tags: false,
             automatic_title: true,
             manual_title: String::new(),
-            recording_dir: base.join("Music").join("RustDJ-Aufnahmen"),
+            recording_dir: base.join("Music").join("RustDJ-Recordings"),
         }
     }
 }
@@ -62,21 +62,21 @@ impl Default for StreamSettings {
 impl StreamSettings {
     fn validate(&self, password: &str) -> Result<(), String> {
         if self.host.trim().is_empty() || self.host.contains(['/', '\\', '\r', '\n', ' ', '\t']) {
-            return Err("Server als Hostname oder IP ohne http:// und ohne Pfad eingeben.".into());
+            return Err(
+                "Enter the server as a hostname or IP address without http:// or a path.".into(),
+            );
         }
         if self.source_port == 0 || self.admin_port == 0 || self.stream_id == 0 {
-            return Err("Ports und Stream-ID müssen größer als 0 sein.".into());
+            return Err("Ports and stream ID must be greater than zero.".into());
         }
         if password.is_empty() || password.chars().any(char::is_control) {
-            return Err("Ein gültiges Source-Passwort eingeben.".into());
+            return Err("Enter a valid source password.".into());
         }
         if [&self.station, &self.genre, &self.url]
             .iter()
             .any(|s| s.chars().any(char::is_control))
         {
-            return Err(
-                "Stationsdaten dürfen keine Zeilenumbrüche oder Steuerzeichen enthalten.".into(),
-            );
+            return Err("Station details cannot contain line breaks or control characters.".into());
         }
         bitrate(self.bitrate)?;
         Ok(())
@@ -107,12 +107,12 @@ pub struct Status {
 impl Status {
     pub fn label(&self) -> &str {
         match self.phase {
-            Phase::Idle => "AUS",
-            Phase::Starting => "STARTET …",
-            Phase::Running => "AKTIV",
-            Phase::Stopping => "WIRD BEENDET …",
-            Phase::Done => "BEENDET",
-            Phase::Error => "FEHLER",
+            Phase::Idle => "OFF",
+            Phase::Starting => "STARTING …",
+            Phase::Running => "ACTIVE",
+            Phase::Stopping => "STOPPING …",
+            Phase::Done => "STOPPED",
+            Phase::Error => "ERROR",
         }
     }
 }
@@ -144,11 +144,11 @@ impl Job {
             update(&thread_status, |status| match result {
                 Ok(()) => {
                     status.phase = Phase::Done;
-                    status.message = "Beendet".into();
+                    status.message = "Stopped".into();
                 }
                 Err(error) if thread_stop.load(Ordering::Acquire) => {
                     status.phase = Phase::Done;
-                    status.message = format!("Beendet: {error}");
+                    status.message = format!("Stopped: {error}");
                 }
                 Err(error) => {
                     status.phase = Phase::Error;
@@ -206,7 +206,7 @@ impl Broadcaster {
         password: String,
     ) -> Result<(), String> {
         if self.stream_busy() {
-            return Err("Der Stream läuft bereits oder wird noch beendet.".into());
+            return Err("The stream is already running or is still stopping.".into());
         }
         settings.validate(&password)?;
         self.metadata
@@ -252,11 +252,11 @@ impl Broadcaster {
         settings: &StreamSettings,
     ) -> Result<(), String> {
         if self.recording_busy() {
-            return Err("Eine Aufnahme läuft bereits oder wird noch abgeschlossen.".into());
+            return Err("A recording is already running or is still being finalized.".into());
         }
         bitrate(settings.bitrate)?;
         if settings.recording_dir.as_os_str().is_empty() {
-            return Err("Einen Aufnahmeordner auswählen.".into());
+            return Err("Choose a recording folder.".into());
         }
         let directory = settings.recording_dir.clone();
         let rate = settings.bitrate;
@@ -276,7 +276,7 @@ impl Broadcaster {
             let finalized = file
                 .flush()
                 .and_then(|_| file.get_ref().sync_all())
-                .map_err(|e| format!("MP3 konnte nicht abgeschlossen werden: {e}"));
+                .map_err(|e| format!("Could not finalize MP3: {e}"));
             result.and(finalized)
         }));
         self.poll();
@@ -319,7 +319,8 @@ impl Broadcaster {
                     let finished = job.take().unwrap();
                     if finished.thread.join().is_err() {
                         status.phase = Phase::Error;
-                        status.message = "Encoder-Hintergrundthread unerwartet beendet.".into();
+                        status.message =
+                            "The encoder background thread stopped unexpectedly.".into();
                     } else {
                         *status = finished
                             .status
@@ -352,7 +353,7 @@ fn bitrate(value: u16) -> Result<Bitrate, String> {
         192 => Ok(Bitrate::Kbps192),
         256 => Ok(Bitrate::Kbps256),
         320 => Ok(Bitrate::Kbps320),
-        _ => Err("MP3-Bitrate: 128, 192, 256 oder 320 kbit/s wählen.".into()),
+        _ => Err("Choose an MP3 bitrate of 128, 192, 256 or 320 kbit/s.".into()),
     }
 }
 
@@ -369,7 +370,7 @@ fn encoder(rate: u32, kbps: u16) -> Result<Encoder, String> {
             .with_quality(Quality::NearBest)?
             .build()
     };
-    configure().map_err(|e| format!("MP3-Encoder konnte nicht gestartet werden: {e}"))
+    configure().map_err(|e| format!("Could not start MP3 encoder: {e}"))
 }
 
 struct CaptureSession(Arc<PcmBuffer>);
@@ -393,7 +394,7 @@ fn encode_master(
     buffer.begin();
     update(status, |status| {
         status.phase = Phase::Running;
-        status.message = "Master-Signal wird verarbeitet".into();
+        status.message = "Processing master audio".into();
     });
     let mut frames = 0_u64;
     let mut bytes = 0_u64;
@@ -416,10 +417,10 @@ fn encode_master(
         mp3.clear();
         encoder
             .encode_to_vec(InterleavedPcm(&pcm), &mut mp3)
-            .map_err(|e| format!("MP3-Encoding fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("MP3 encoding failed: {e}"))?;
         output
             .write_all(&mp3)
-            .map_err(|e| format!("MP3-Ausgabe unterbrochen: {e}"))?;
+            .map_err(|e| format!("MP3 output interrupted: {e}"))?;
         frames += count as u64;
         bytes += mp3.len() as u64;
         update(status, |status| {
@@ -430,20 +431,20 @@ fn encode_master(
     mp3.clear();
     encoder
         .flush_to_vec::<FlushGap>(&mut mp3)
-        .map_err(|e| format!("MP3-Abschluss fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("MP3 finalization failed: {e}"))?;
     output
         .write_all(&mp3)
-        .map_err(|e| format!("MP3-Abschluss konnte nicht geschrieben werden: {e}"))?;
+        .map_err(|e| format!("Could not write MP3 finalization data: {e}"))?;
     update(status, |status| status.bytes = bytes + mp3.len() as u64);
     if overflow {
-        Err("Master-Puffer übergelaufen; Ausgabe beendet. Encoder/Server/Datenträger konnte nicht folgen.".into())
+        Err("Master buffer overflow; output stopped. The encoder, server or disk could not keep up.".into())
     } else {
         Ok(())
     }
 }
 
 fn recording_file(directory: &Path) -> Result<(PathBuf, File), String> {
-    fs::create_dir_all(directory).map_err(|e| format!("Aufnahmeordner nicht verfügbar: {e}"))?;
+    fs::create_dir_all(directory).map_err(|e| format!("Recording folder unavailable: {e}"))?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -453,10 +454,10 @@ fn recording_file(directory: &Path) -> Result<(PathBuf, File), String> {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("Aufnahme konnte nicht angelegt werden: {error}")),
+            Err(error) => return Err(format!("Could not create recording: {error}")),
         }
     }
-    Err("Kein freier Aufnahmedateiname verfügbar.".into())
+    Err("No unused recording filename is available.".into())
 }
 
 fn connect(host: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream, String> {
@@ -476,15 +477,15 @@ fn connect(host: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream, String
     let deadline = Instant::now() + Duration::from_secs(5);
     let addresses = loop {
         if stop.load(Ordering::Acquire) {
-            return Err("Verbindung abgebrochen".into());
+            return Err("Connection cancelled".into());
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(addresses)) => break addresses,
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Servername konnte nicht aufgelöst werden.".into());
+                return Err("Could not resolve server hostname.".into());
             }
             Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                return Err("Zeitüberschreitung bei der Serversuche.".into());
+                return Err("Server lookup timed out.".into());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -492,7 +493,7 @@ fn connect(host: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream, String
     for address in addresses {
         while Instant::now() < deadline {
             if stop.load(Ordering::Acquire) {
-                return Err("Verbindung abgebrochen".into());
+                return Err("Connection cancelled".into());
             }
             match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
                 Ok(socket) => {
@@ -510,7 +511,7 @@ fn connect(host: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream, String
             }
         }
     }
-    Err("SHOUTcast-Server/Port nicht erreichbar.".into())
+    Err("SHOUTcast server/port is unreachable.".into())
 }
 
 fn authenticate(
@@ -520,7 +521,7 @@ fn authenticate(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     if stop.load(Ordering::Acquire) {
-        return Err("Verbindung abgebrochen".into());
+        return Err("Connection cancelled".into());
     }
     let auth = if settings.stream_id == 1 {
         password.to_owned()
@@ -529,11 +530,11 @@ fn authenticate(
     };
     socket
         .write_all(format!("{auth}\r\n").as_bytes())
-        .map_err(|_| "Source-Anmeldung konnte nicht gesendet werden.".to_owned())?;
+        .map_err(|_| "Could not send source login.".to_owned())?;
     let response = read_response(socket, stop, true)?;
     if response.lines().next().unwrap_or("").trim() != "OK2" {
         return Err(
-            "SHOUTcast-Anmeldung abgelehnt. Source-Passwort, Port und Stream-ID prüfen.".into(),
+            "SHOUTcast login rejected. Check the source password, port and stream ID.".into(),
         );
     }
     let headers = format!(
@@ -542,7 +543,7 @@ fn authenticate(
     );
     socket
         .write_all(headers.as_bytes())
-        .map_err(|_| "SHOUTcast-Streamdaten konnten nicht angemeldet werden.".into())
+        .map_err(|_| "Could not register SHOUTcast stream details.".into())
 }
 
 struct NetworkWriter<'a> {
@@ -565,13 +566,13 @@ impl Write for NetworkWriter<'_> {
                     .stop_deadline
                     .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
                 if Instant::now() >= *end {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "Stream beendet"));
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "Stream stopped"));
                 }
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Stream-Server nimmt keine Audiodaten an",
+                    "The stream server is not accepting audio",
                 ));
             }
             match self.socket.write(bytes) {
@@ -601,10 +602,10 @@ fn read_response(
     let mut chunk = [0_u8; 1024];
     while bytes.len() < 16384 {
         if stop.load(Ordering::Acquire) {
-            return Err("Verbindung abgebrochen".into());
+            return Err("Connection cancelled".into());
         }
         if Instant::now() >= deadline {
-            return Err("SHOUTcast-Antwort fehlt oder ist verspätet.".into());
+            return Err("SHOUTcast response is missing or timed out.".into());
         }
         match socket.read(&mut chunk) {
             Ok(0) => break,
@@ -621,7 +622,7 @@ fn read_response(
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::Interrupted
                 ) => {}
-            Err(_) => return Err("SHOUTcast-Antwort konnte nicht gelesen werden.".into()),
+            Err(_) => return Err("Could not read SHOUTcast response.".into()),
         }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -663,7 +664,7 @@ fn send_metadata(
     );
     socket
         .write_all(request.as_bytes())
-        .map_err(|_| "Titel-Tags konnten nicht gesendet werden.".to_owned())?;
+        .map_err(|_| "Could not send track titles.".to_owned())?;
     let response = read_response(&mut socket, stop, false)?;
     let first = response.lines().next().unwrap_or("");
     let body = response.to_ascii_lowercase();
@@ -679,7 +680,7 @@ fn send_metadata(
         .any(|text| body.contains(text))
     {
         return Err(
-            "Server hat Titel-Tags abgelehnt. Metadata-Port und Source-Passwort prüfen.".into(),
+            "The server rejected track titles. Check the metadata port and source password.".into(),
         );
     }
     Ok(())

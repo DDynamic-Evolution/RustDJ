@@ -18,7 +18,7 @@ fn wait_for(mut check: impl FnMut() -> bool, description: &str) -> Result<(), St
         }
         thread::sleep(Duration::from_millis(10));
     }
-    Err(format!("Zeitüberschreitung: {description}"))
+    Err(format!("Timed out: {description}"))
 }
 
 fn run() -> Result<String, String> {
@@ -32,7 +32,7 @@ fn run() -> Result<String, String> {
     let phones = devices
         .iter()
         .find(|d| d.name != master_name && d.channels >= 2)
-        .ok_or("Kein zweiter Ausgang für den Test vorhanden.")?;
+        .ok_or("No second output is available for this test.")?;
     let routing = Routing {
         master: Target {
             device: Some(master_name.clone()),
@@ -45,7 +45,7 @@ fn run() -> Result<String, String> {
     };
     let audio = Audio::open(routing)?;
     if audio.phones().is_none() {
-        return Err("Kopfhörerausgang fehlt.".into());
+        return Err("Headphone output is missing.".into());
     }
     let context = eframe::egui::Context::default();
     let mut deck = Deck::default();
@@ -58,10 +58,10 @@ fn run() -> Result<String, String> {
             deck.poll(&audio);
             !deck.loading()
         },
-        "MP3 laden",
+        "load MP3",
     )?;
     if deck.track.is_none() {
-        return Err(format!("Dateiladen: {:?}", deck.error));
+        return Err(format!("File loading: {:?}", deck.error));
     }
     deck.apply_buses(0.0, 0.0); // Both hardware outputs stay silent throughout.
     deck.toggle(&audio);
@@ -72,11 +72,11 @@ fn run() -> Result<String, String> {
                     .phones_position()
                     .is_some_and(|p| p > Duration::from_millis(150))
         },
-        "beide Audio-Uhren starten",
+        "start both audio clocks",
     )?;
     deck.toggle(&audio);
     if deck.playing() {
-        return Err("Pause fehlgeschlagen.".into());
+        return Err("Pause failed.".into());
     }
     deck.speed = 1.25;
     deck.apply_buses(0.0, 0.0);
@@ -89,7 +89,7 @@ fn run() -> Result<String, String> {
             > Duration::from_millis(100)
     {
         return Err(format!(
-            "Seek bei 125 %: Master {:?}, Phones {:?}",
+            "Seek at 125%: Master {:?}, Phones {:?}",
             deck.position(),
             deck.phones_position()
         ));
@@ -99,18 +99,18 @@ fn run() -> Result<String, String> {
     deck.apply_buses(0.0, 0.0);
     wait_for(
         || deck.playing() && deck.position() > Duration::from_millis(1100),
-        "Cue-Vorschau halten",
+        "hold Cue preview",
     )?;
     deck.cue_button(false, &audio);
     if deck.playing()
         || deck.position().abs_diff(deck.cue) > Duration::from_millis(100)
         || deck.phones_position().unwrap().abs_diff(deck.cue) > Duration::from_millis(100)
     {
-        return Err("Cue loslassen setzt nicht beide Wege zurück.".into());
+        return Err("Releasing Cue did not reset both outputs.".into());
     }
     deck.hotcue(0, &audio);
     if deck.hotcues[0].is_none() {
-        return Err("Hotcue setzen fehlgeschlagen.".into());
+        return Err("Setting a hotcue failed.".into());
     }
     deck.seek(Duration::from_millis(2500), &audio);
     deck.hotcue(1, &audio);
@@ -118,7 +118,7 @@ fn run() -> Result<String, String> {
     deck.apply_buses(0.0, 0.0);
     wait_for(
         || deck.playing() && deck.position() > Duration::from_millis(1100),
-        "Hotcue springen und spielen",
+        "jump to hotcue and play",
     )?;
     deck.beat_loop(1.0, &audio);
     wait_for(
@@ -126,7 +126,7 @@ fn run() -> Result<String, String> {
             deck.poll(&audio);
             deck.loop_active && !deck.loop_pending()
         },
-        "Beat-Loop vorbereiten",
+        "prepare beat loop",
     )?;
     let range = deck.loop_range.unwrap();
     let mut wraps = 0;
@@ -141,14 +141,14 @@ fn run() -> Result<String, String> {
         }
         if !range.contains(position) || !range.contains(deck.phones_position().unwrap()) {
             return Err(format!(
-                "Loop verlässt Grenzen: Master {position:?}, Phones {:?}",
+                "Loop out of bounds: Master {position:?}, Phones {:?}",
                 deck.phones_position()
             ));
         }
         previous = position;
     }
     if wraps < 2 {
-        return Err(format!("Loop wiederholt sich nicht: {wraps} Rücksprünge."));
+        return Err(format!("Loop did not repeat: {wraps} wraps."));
     }
     deck.resize_loop(2.0, &audio);
     wait_for(
@@ -156,19 +156,19 @@ fn run() -> Result<String, String> {
             deck.poll(&audio);
             deck.loop_active && !deck.loop_pending()
         },
-        "Loop verdoppeln",
+        "double loop",
     )?;
     if (deck.loop_range.unwrap().end - deck.loop_range.unwrap().start)
         .abs_diff(Duration::from_secs(1))
         > Duration::from_millis(10)
     {
-        return Err("Verdoppelter Loop hat falsche Länge.".into());
+        return Err("The doubled loop has the wrong length.".into());
     }
     let end = deck.loop_range.unwrap().end;
     deck.exit_loop();
     wait_for(
         || deck.playing() && deck.position() > end + Duration::from_millis(50),
-        "Loop verlassen und linear weiterspielen",
+        "exit loop and continue playback",
     )?;
     deck.toggle(&audio);
     deck.seek(Duration::from_secs(3), &audio);
@@ -180,13 +180,13 @@ fn run() -> Result<String, String> {
             deck.poll(&audio);
             deck.loop_active && !deck.loop_pending()
         },
-        "manuellen IN/OUT-Loop vorbereiten",
+        "prepare manual IN/OUT loop",
     )?;
     deck.toggle(&audio);
     deck.apply_buses(0.0, 0.0);
     thread::sleep(Duration::from_millis(750));
     if !deck.loop_range.unwrap().contains(deck.position()) {
-        return Err("Manueller Loop wiederholt nicht.".into());
+        return Err("The manual loop did not repeat.".into());
     }
     deck.reloop(&audio);
     deck.reloop(&audio);
@@ -199,11 +199,11 @@ fn run() -> Result<String, String> {
     )?;
     deck.clear_hotcue(0);
     if deck.hotcues[0].is_some() || deck.hotcues[1].is_none() {
-        return Err("Hotcue löschen beeinflusst andere Pads.".into());
+        return Err("Clearing a hotcue affected other pads.".into());
     }
     deck.stop(&audio);
     if deck.loop_active || deck.loop_pending() || deck.position() > Duration::from_millis(50) {
-        return Err("Stop beendet den Loop nicht.".into());
+        return Err("Stop did not exit the loop.".into());
     }
     if Audio::open(Routing {
         master: Target::default(),
@@ -211,10 +211,10 @@ fn run() -> Result<String, String> {
     })
     .is_ok()
     {
-        return Err("Überlappende Ausgänge wurden nicht gesperrt.".into());
+        return Err("Overlapping outputs were not blocked.".into());
     }
     Ok(format!(
-        "PASS\nMaster: {master_name}\nPhones: {}\nBeide Audio-Uhren, Pause, Seek bei 125 %, Cue halten/loslassen, Hotcues setzen/springen/loeschen, Beat-Loop mit mehreren Rueckspruengen auf beiden Wegen, Verdoppeln, Loop verlassen, manueller IN/OUT-Loop, Reloop, Stop, Kanal-Kollisionsschutz.\nAlle Ausgangspegel waren 0.\n",
+        "PASS\nMaster: {master_name}\nPhones: {}\nBoth audio clocks, pause, seek at 125%, Cue hold/release, hotcue set/jump/clear, repeated beat loops on both outputs, double loop, exit loop, manual IN/OUT loop, reloop, stop and channel overlap protection.\nAll output levels were zero.\n",
         phones.name
     ))
 }
