@@ -1,4 +1,4 @@
-# RustDJ 0.19
+# RustDJ 0.20
 
 RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
@@ -19,7 +19,8 @@ The interface, tooltips, dialogs and application messages are in English.
 - A switchable crossfader and an additional saved 10-band master equalizer.
 - Independent master and headphone output devices/channel pairs with stereo meters.
 - Roland DJ-202 auto-connect, four-deck MIDI banks, pad support, LEDs and MIDI learn.
-- SHOUTcast-compatible broadcasting, optional track titles and independent MP3 recording.
+- SHOUTcast-compatible broadcasting with verified TLS, optional HTTPS track titles
+  and independent MP3 recording.
 
 ## Getting started
 
@@ -242,16 +243,33 @@ master level and master EQ. Direct headphone cue is excluded. Muting the
 software master also mutes the stream and recording.
 
 Enter the hostname/IP, source port, metadata/admin port, stream ID, source
-password and optional station details. Use your provider's actual ports; common
-values are source 8001 and metadata 8000. The source connection is SHOUTcast
-1-compatible and supports DNAS 2 stream IDs. This is a source connection to a
-SHOUTcast server, not a built-in listener server.
+password and optional station details. **TLS (certificate verified)** is the
+default transport for both the source connection and HTTPS metadata updates,
+including when loading settings saved by older versions. Use your provider's
+TLS-enabled ports and a hostname matching the certificate. Legacy ports such as
+8001/8000 may not support TLS. The source protocol is SHOUTcast 1-compatible and
+supports DNAS 2 stream IDs; TLS requires a compatible source endpoint or a TLS
+proxy. RustDJ is a source client, not a built-in listener server.
+
+TLS 1.2/1.3 uses rustls and bundled Mozilla trust roots. The certificate chain,
+validity and hostname/IP are checked before sending any source password or
+metadata request. Invalid, expired and untrusted certificates abort the affected
+connection. There is no automatic fallback to plaintext and no certificate
+verification bypass. A TLS failure does not interrupt an independent MP3 recording.
+
+**Unencrypted legacy TCP / HTTP** must be selected explicitly. A warning remains
+visible and the start button changes to **Start unencrypted stream**. In this
+mode, both source credentials and metadata credentials are visible to anyone
+able to read the network traffic. Use it only on a trusted local connection or
+inside a separately secured tunnel. See [SECURITY.md](SECURITY.md).
 
 Enable **Send track titles to the server** for optional metadata. Automatic mode
 uses the filename-derived title of the playing deck with the highest master
 contribution; a manual title is also available. A metadata error does not stop
 the audio stream. The source password is also used for metadata updates, so the
-server must permit it for that purpose.
+server must permit it for that purpose. The SHOUTcast admin API still receives
+the password as a query parameter inside HTTPS. TLS hides it on the wire;
+server or reverse-proxy access logs may record the URL and must redact it.
 
 MP3 output is stereo at 44.1 kHz with selectable CBR **128, 192, 256 or 320 kbit/s**.
 Bitrate changes apply to newly started sessions. Streaming and recording run
@@ -262,7 +280,7 @@ settings is `Music\RustDJ-Recordings` in the Windows user folder. Files are name
 `RustDJ-Master-<timestamp>-<number>.mp3`; existing files are not overwritten.
 **Stop recording** finalizes the MP3. Close normally to allow pending data to flush.
 
-Settings are saved, including ports, station details, title options, bitrate and
+Settings are saved, including transport security, ports, station details, title options, bitrate and
 recording folder. The password is encrypted with Windows DPAPI for the current
 user account and restored at startup. A password restoration error is shown;
 there is no plaintext fallback. Streaming and recording never start automatically.
@@ -316,15 +334,17 @@ cd RustDJ
 With a regular Rust installation, `cargo run` and `cargo build --release` also
 work. `dev.ps1` uses an existing local `.tools` toolchain when available.
 
-The two targeted regression tests for the English update are:
+The two targeted security regression tests for version 0.20 run with:
 
 ```powershell
-cargo test --lib controller12_unlocks_layers_and_tracks_modes_without_hijacking_midi_learn
-cargo test --lib regression18_visible_output_sliders_control_four_decks_and_persist_levels
+cargo test --lib tls20_
 ```
 
-They cover pad initialization/mode handling and actual narrow-layout slider
-input, saved levels and rendered master/headphone samples from four decks.
+They use real local TLS 1.2/1.3 peers and capture raw network bytes. Checks cover
+source/audio and metadata delivery, trusted certificates, untrusted/expired/
+wrong-host rejection before credentials, plaintext peers without downgrade,
+handshake cancellation and secure migration of older settings. No public
+SHOUTcast server or real streaming password is used in these checks.
 The MIDI bank regression can also be run with `cargo test --lib regression18_native`.
 A full test run is available through `cargo test` or `.\dev.ps1 test`.
 The hardware audio test is ignored by default and can be requested with
@@ -350,7 +370,7 @@ The `work/` folder is used for local checks and packaging and is not committed.
 | `midi`, `decks` | Controller mapping and deck identity |
 | `track`, `analysis`, `beat`, `key`, `waveform` | Decoding and track analysis |
 | `database`, `performance`, `settings`, `credentials` | Cached data and saved preferences |
-| `capture`, `streamer` | Master capture, SHOUTcast and MP3 recording |
+| `capture`, `streamer`, `stream_transport` | Master capture, verified TLS, SHOUTcast and MP3 recording |
 
 The GUI uses eframe/egui. Playback uses rodio/Symphonia, MIDI uses midir, SQLite
 uses rusqlite, and background MP3 encoding uses LAME through mp3lame-encoder.

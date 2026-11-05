@@ -1,18 +1,18 @@
-//! SHOUTcast 1-compatible source connection (including DNAS 2 stream IDs),
+//! SHOUTcast source connection over verified TLS (including DNAS 2 stream IDs),
 //! optional song updates, and independent MP3 master recordings.
 use crate::capture::{MasterCapture, PcmBuffer};
+pub use crate::stream_transport::ConnectionSecurity;
+use crate::stream_transport::{Connection, Connector, retryable};
 use mp3lame_encoder::{Bitrate, Builder, Encoder, FlushGap, InterleavedPcm, Quality, VbrMode};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Read, Write},
-    net::{Shutdown, TcpStream, ToSocketAddrs},
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,6 +25,7 @@ pub struct StreamSettings {
     pub host: String,
     pub source_port: u16,
     pub admin_port: u16,
+    pub security: ConnectionSecurity,
     pub stream_id: u32,
     pub station: String,
     pub genre: String,
@@ -46,6 +47,7 @@ impl Default for StreamSettings {
             host: String::new(),
             source_port: 8001,
             admin_port: 8000,
+            security: ConnectionSecurity::Tls,
             stream_id: 1,
             station: "RustDJ".into(),
             genre: String::new(),
@@ -215,14 +217,21 @@ impl Broadcaster {
             .enabled = settings.send_tags;
         let metadata = self.metadata.clone();
         self.stream_job = Some(Job::spawn(move |stop, status| {
-            let mut socket = connect(&settings.host, settings.source_port, &stop)?;
-            authenticate(&mut socket, &settings, &password, &stop)?;
+            let connector = Connector::default();
+            let mut socket = open_source(&connector, &settings, &password, &stop)?;
             let encoder = encoder(capture.sample_rate, settings.bitrate)?;
             let tag_stop = Arc::new(AtomicBool::new(false));
             let thread_tag_stop = tag_stop.clone();
             let tag_status = status.clone();
             let tag_thread = thread::spawn(move || {
-                metadata_loop(settings, password, metadata, thread_tag_stop, tag_status)
+                metadata_loop(
+                    settings,
+                    password,
+                    metadata,
+                    thread_tag_stop,
+                    tag_status,
+                    connector,
+                )
             });
             let mut output = NetworkWriter {
                 socket: &mut socket,
@@ -238,7 +247,7 @@ impl Broadcaster {
                 &mut output,
             );
             tag_stop.store(true, Ordering::Release);
-            let _ = socket.shutdown(Shutdown::Both);
+            let _ = socket.shutdown();
             let _ = tag_thread.join();
             result
         }));
@@ -460,62 +469,25 @@ fn recording_file(directory: &Path) -> Result<(PathBuf, File), String> {
     Err("No unused recording filename is available.".into())
 }
 
-fn connect(host: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream, String> {
-    let host = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_owned();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(
-            (host.as_str(), port)
-                .to_socket_addrs()
-                .map(|a| a.collect::<Vec<_>>()),
-        );
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let addresses = loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("Connection cancelled".into());
-        }
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(addresses)) => break addresses,
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Could not resolve server hostname.".into());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                return Err("Server lookup timed out.".into());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    };
-    for address in addresses {
-        while Instant::now() < deadline {
-            if stop.load(Ordering::Acquire) {
-                return Err("Connection cancelled".into());
-            }
-            match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-                Ok(socket) => {
-                    socket
-                        .set_read_timeout(Some(Duration::from_millis(200)))
-                        .map_err(|e| e.to_string())?;
-                    socket
-                        .set_write_timeout(Some(Duration::from_millis(200)))
-                        .map_err(|e| e.to_string())?;
-                    let _ = socket.set_nodelay(true);
-                    return Ok(socket);
-                }
-                Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    Err("SHOUTcast server/port is unreachable.".into())
+fn open_source(
+    connector: &Connector,
+    settings: &StreamSettings,
+    password: &str,
+    stop: &AtomicBool,
+) -> Result<Connection, String> {
+    settings.validate(password)?;
+    let mut socket = connector.connect(
+        &settings.host,
+        settings.source_port,
+        settings.security,
+        stop,
+    )?;
+    authenticate(&mut socket, settings, password, stop)?;
+    Ok(socket)
 }
 
 fn authenticate(
-    socket: &mut TcpStream,
+    socket: &mut Connection,
     settings: &StreamSettings,
     password: &str,
     stop: &AtomicBool,
@@ -538,8 +510,12 @@ fn authenticate(
         );
     }
     let headers = format!(
-        "icy-name:{}\r\nicy-genre:{}\r\nicy-url:{}\r\nicy-pub:0\r\nicy-br:{}\r\ncontent-type:audio/mpeg\r\nUser-Agent:RustDJ/0.16\r\n\r\n",
-        settings.station, settings.genre, settings.url, settings.bitrate
+        "icy-name:{}\r\nicy-genre:{}\r\nicy-url:{}\r\nicy-pub:0\r\nicy-br:{}\r\ncontent-type:audio/mpeg\r\nUser-Agent:RustDJ/{}\r\n\r\n",
+        settings.station,
+        settings.genre,
+        settings.url,
+        settings.bitrate,
+        env!("CARGO_PKG_VERSION")
     );
     socket
         .write_all(headers.as_bytes())
@@ -547,7 +523,7 @@ fn authenticate(
 }
 
 struct NetworkWriter<'a> {
-    socket: &'a mut TcpStream,
+    socket: &'a mut Connection,
     stop: &'a AtomicBool,
     stop_deadline: Option<Instant>,
 }
@@ -556,25 +532,19 @@ impl Write for NetworkWriter<'_> {
         self.socket.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            self.check_deadline(deadline)?;
+            match self.socket.flush() {
+                Err(error) if retryable(&error) => thread::sleep(Duration::from_millis(2)),
+                result => return result,
+            }
+        }
     }
     fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !bytes.is_empty() {
-            if self.stop.load(Ordering::Acquire) {
-                let end = self
-                    .stop_deadline
-                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
-                if Instant::now() >= *end {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "Stream stopped"));
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "The stream server is not accepting audio",
-                ));
-            }
+            self.check_deadline(deadline)?;
             match self.socket.write(bytes) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(count) => bytes = &bytes[count..],
@@ -584,7 +554,10 @@ impl Write for NetworkWriter<'_> {
                         io::ErrorKind::TimedOut
                             | io::ErrorKind::WouldBlock
                             | io::ErrorKind::Interrupted
-                    ) => {}
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(2))
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -592,8 +565,28 @@ impl Write for NetworkWriter<'_> {
     }
 }
 
+impl NetworkWriter<'_> {
+    fn check_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        if self.stop.load(Ordering::Acquire) {
+            let end = self
+                .stop_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+            if Instant::now() >= *end {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Stream stopped"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The stream server is not accepting audio",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn read_response(
-    socket: &mut TcpStream,
+    socket: &mut Connection,
     stop: &AtomicBool,
     line_only: bool,
 ) -> Result<String, String> {
@@ -621,7 +614,10 @@ fn read_response(
                     io::ErrorKind::TimedOut
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::Interrupted
-                ) => {}
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(2))
+            }
             Err(_) => return Err("Could not read SHOUTcast response.".into()),
         }
     }
@@ -642,12 +638,14 @@ fn percent(value: &str) -> String {
 }
 
 fn send_metadata(
+    connector: &Connector,
     settings: &StreamSettings,
     password: &str,
     title: &str,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let mut socket = connect(&settings.host, settings.admin_port, stop)?;
+    let mut socket =
+        connector.connect(&settings.host, settings.admin_port, settings.security, stop)?;
     let host = settings.host.trim();
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -655,12 +653,13 @@ fn send_metadata(
         host.to_owned()
     };
     let request = format!(
-        "GET /admin.cgi?sid={}&mode=updinfo&pass={}&song={} HTTP/1.0\r\nHost: {}:{}\r\nUser-Agent: RustDJ/0.16\r\nConnection: close\r\n\r\n",
+        "GET /admin.cgi?sid={}&mode=updinfo&pass={}&song={} HTTP/1.0\r\nHost: {}:{}\r\nUser-Agent: RustDJ/{}\r\nConnection: close\r\n\r\n",
         settings.stream_id,
         percent(password),
         percent(title),
         host,
-        settings.admin_port
+        settings.admin_port,
+        env!("CARGO_PKG_VERSION")
     );
     socket
         .write_all(request.as_bytes())
@@ -692,6 +691,7 @@ fn metadata_loop(
     metadata: Arc<Mutex<Metadata>>,
     stop: Arc<AtomicBool>,
     status: SharedStatus,
+    connector: Connector,
 ) {
     let mut previous = None;
     let mut last_attempt = Instant::now() - Duration::from_secs(3);
@@ -704,7 +704,7 @@ fn metadata_loop(
             if previous.as_ref() != Some(&title) && last_attempt.elapsed() >= Duration::from_secs(2)
             {
                 last_attempt = Instant::now();
-                let result = send_metadata(&settings, &password, &title, &stop);
+                let result = send_metadata(&connector, &settings, &password, &title, &stop);
                 update(&status, |status| {
                     status.metadata_error = result.as_ref().err().cloned()
                 });
@@ -718,6 +718,9 @@ fn metadata_loop(
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[cfg(test)]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
@@ -811,6 +814,7 @@ mod tests {
             });
             let settings = StreamSettings {
                 host: "127.0.0.1".into(),
+                security: ConnectionSecurity::Plaintext,
                 source_port,
                 admin_port,
                 stream_id: 2,
@@ -900,6 +904,7 @@ mod tests {
         });
         let settings = StreamSettings {
             host: "127.0.0.1".into(),
+            security: ConnectionSecurity::Plaintext,
             source_port,
             recording_dir: directory.path().into(),
             ..StreamSettings::default()

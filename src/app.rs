@@ -12,7 +12,7 @@ use crate::{
     performance::Store as HotcueStore,
     playlist::{Item, Playlist},
     settings::{self, MixSettings, Settings},
-    streamer::{Broadcaster, Phase, StreamSettings},
+    streamer::{Broadcaster, ConnectionSecurity, Phase, StreamSettings},
     track,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
@@ -233,7 +233,7 @@ impl RustDj {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RUST").size(21.0).strong());
             ui.label(RichText::new("DJ").size(21.0).strong().color(PURPLE));
-            ui.label(RichText::new("0.19 / 4 DECKS").size(10.0).color(MUTED));
+            ui.label(RichText::new("0.20 / 4 DECKS").size(10.0).color(MUTED));
             ui.separator();
             let midi =
                 controller_status(self.midi.connected.as_deref(), self.midi.prefs.auto_connect);
@@ -758,6 +758,11 @@ impl RustDj {
                 ui.add_enabled_ui(!stream_busy, |ui| {
                     ui.spacing_mut().text_edit_width = 360.0;
                     egui::Grid::new("shoutcast-config").num_columns(2).spacing([14.0, 7.0]).show(ui, |ui| {
+                        ui.label("Transport security");
+                        egui::ComboBox::from_id_salt("stream-security").selected_text(self.stream_settings.security.label()).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.stream_settings.security, ConnectionSecurity::Tls, ConnectionSecurity::Tls.label());
+                            ui.selectable_value(&mut self.stream_settings.security, ConnectionSecurity::Plaintext, ConnectionSecurity::Plaintext.label());
+                        }); ui.end_row();
                         ui.label("Server / IP"); ui.text_edit_singleline(&mut self.stream_settings.host).on_hover_text("Hostname or IP address without http:// or a path"); ui.end_row();
                         ui.label("Source port"); ui.add(egui::DragValue::new(&mut self.stream_settings.source_port).range(1..=u16::MAX)); ui.end_row();
                         ui.label("Metadata/admin port"); ui.add(egui::DragValue::new(&mut self.stream_settings.admin_port).range(1..=u16::MAX)); ui.end_row();
@@ -768,6 +773,11 @@ impl RustDj {
                         ui.label("Station URL (optional)"); ui.text_edit_singleline(&mut self.stream_settings.url); ui.end_row();
                     });
                 });
+                if self.stream_settings.security == ConnectionSecurity::Plaintext {
+                    ui.colored_label(WARNING, "UNENCRYPTED: the source password and metadata password are exposed on the network. Use only on a trusted local or separately encrypted connection.");
+                } else {
+                    ui.label(RichText::new("TLS protects both source login/audio and HTTPS metadata. The certificate and hostname are verified. Use your provider's TLS-enabled ports; there is no plaintext fallback.").small().color(MUTED));
+                }
                 if let Some(error) = &self.stream_password_error { ui.colored_label(WARNING, error); }
                 ui.horizontal(|ui| {
                     ui.label("MP3 bitrate for new sessions");
@@ -775,7 +785,7 @@ impl RustDj {
                         for bitrate in [128, 192, 256, 320] { ui.selectable_value(&mut self.stream_settings.bitrate, bitrate, format!("{bitrate} kbit/s")); }
                     });
                 });
-                ui.label(RichText::new("SHOUTcast 1-compatible source connection, including DNAS 2 with a stream ID. Common ports: source 8001, metadata 8000; use your provider's settings.").small().color(MUTED));
+                ui.label(RichText::new("SHOUTcast 1-compatible source protocol, including DNAS 2 stream IDs. TLS requires a compatible source endpoint or TLS proxy. Legacy ports 8001/8000 may not support TLS; use your provider's settings.").small().color(MUTED));
                 ui.separator();
                 ui.checkbox(&mut self.stream_settings.send_tags, "Send track titles to the server");
                 ui.add_enabled_ui(self.stream_settings.send_tags, |ui| {
@@ -787,7 +797,7 @@ impl RustDj {
                 ui.horizontal(|ui| {
                     if stream_busy {
                         if ui.button("Stop stream").clicked() { self.broadcaster.stop_stream(); }
-                    } else if ui.add_enabled(master_ready, egui::Button::new("Start stream").fill(PURPLE.gamma_multiply(0.5))).clicked()
+                    } else if ui.add_enabled(master_ready, egui::Button::new(if self.stream_settings.security == ConnectionSecurity::Tls { "Start TLS stream" } else { "Start unencrypted stream" }).fill(PURPLE.gamma_multiply(0.5))).clicked()
                         && let Err(error) = self.broadcaster.start_stream(self.audio.capture.clone(), self.stream_settings.clone(), self.stream_password.clone())
                     { self.broadcaster.stream_status.phase = Phase::Error; self.broadcaster.stream_status.message = error; }
                     let status = &self.broadcaster.stream_status;

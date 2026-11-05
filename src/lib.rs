@@ -18,6 +18,7 @@ pub mod output;
 pub mod performance;
 pub mod playlist;
 pub mod settings;
+mod stream_transport;
 pub mod streamer;
 pub mod track;
 pub mod waveform;
