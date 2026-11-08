@@ -4,6 +4,9 @@ RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
 streaming and MP3 recording in one desktop application.
 
+<img width="1919" height="1030" alt="image" src="https://github.com/user-attachments/assets/c2c3de82-9934-42e5-8d6e-faeae5fc0325" />
+
+
 The interface, tooltips, dialogs and application messages are in English.
 
 ## Features
