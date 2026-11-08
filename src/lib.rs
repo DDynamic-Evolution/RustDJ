@@ -4,6 +4,7 @@ pub mod audio;
 pub mod beat;
 pub mod browser;
 pub mod capture;
+pub mod controller_profiles;
 pub mod credentials;
 pub mod database;
 pub mod decks;

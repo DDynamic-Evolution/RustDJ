@@ -2,6 +2,7 @@ use crate::{
     audio::{Audio, Deck},
     beat::{BeatGrid, sync_plan},
     browser::{Browser, Event as BrowserEvent},
+    controller_profiles::{ProfileFile, ProfileId},
     decks::{COUNT, ORDER},
     dragdrop::{self, Origin, Target as DropTarget, Zones},
     dsp::{bus_gains_with_crossfader, knob_db},
@@ -128,8 +129,10 @@ impl RustDj {
                 .insert(egui::TextStyle::Button, FontId::proportional(12.0));
         });
         let (mut settings, notice) = settings::load();
-        let migrated = settings.mapping_version < 6;
-        if migrated && let Some(bindings) = settings.bindings.take() {
+        let migrated = settings.mapping_version < 7;
+        if settings.mapping_version < 6
+            && let Some(bindings) = settings.bindings.take()
+        {
             settings.bindings = Some(midi::upgrade(bindings));
         }
         let audio = Audio::new(settings.routing.clone());
@@ -233,7 +236,7 @@ impl RustDj {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RUST").size(21.0).strong());
             ui.label(RichText::new("DJ").size(21.0).strong().color(PURPLE));
-            ui.label(RichText::new("0.20 / 4 DECKS").size(10.0).color(MUTED));
+            ui.label(RichText::new("0.21 / 4 DECKS").size(10.0).color(MUTED));
             ui.separator();
             let midi =
                 controller_status(self.midi.connected.as_deref(), self.midi.prefs.auto_connect);
@@ -644,12 +647,23 @@ impl RustDj {
     }
 
     fn controller_ui(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Controller / MIDI").open(&mut self.show_midi).default_width(650.0).resizable(true).show(ctx, |ui| {
-            ui.label("The DJ-202 connects automatically on startup and when plugged in.");
+        egui::Window::new("Controller / MIDI").open(&mut self.show_midi).default_width(700.0).resizable(true).vscroll(true).show(ctx, |ui| {
+            let mut choice=self.midi.prefs.profile;
+            ui.horizontal(|ui| {
+                ui.label("Controller profile");
+                egui::ComboBox::from_id_salt("controller-profile").selected_text(choice.map_or("Automatic (known models)",ProfileId::label)).show_ui(ui,|ui| {
+                    ui.selectable_value(&mut choice,None,"Automatic (known models)");
+                    for profile in ProfileId::ALL { ui.selectable_value(&mut choice,Some(profile),profile.label()); }
+                });
+            });
+            if choice!=self.midi.prefs.profile { self.midi.choose_profile(choice,ctx); }
+            ui.label(RichText::new(format!("Active profile: {}",self.midi.active_profile.label())).strong().color(PURPLE));
+            ui.label(self.midi.active_profile.description());
+            ui.label(RichText::new("Model-specific USB MIDI mappings. Hardware verification is pending; HID, DVS and proprietary displays are not implied.").small().color(MUTED));
             if ui.checkbox(&mut self.midi.prefs.auto_connect, "Connect automatically and reconnect after USB disconnection").changed() { self.midi.dirty = true; }
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Preferred: {}", self.midi.prefs.preferred_port.as_deref().unwrap_or("Detect DJ-202 automatically"))).small());
-                if ui.small_button("Select DJ-202 automatically").clicked() { self.midi.prefs.preferred_port = None; self.midi.prefs.auto_connect = true; self.midi.dirty = true; self.midi.refresh(); }
+                ui.label(RichText::new(format!("Preferred: {}", self.midi.prefs.preferred_port.as_deref().unwrap_or("Detect a supported model"))).small());
+                if ui.small_button("Auto-detect device").clicked() { self.midi.prefs.preferred_port = None; self.midi.prefs.auto_connect = true; self.midi.dirty = true; self.midi.refresh(); }
             });
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("midi-port").selected_text(self.midi.ports.get(self.midi.selected_port).map_or("No MIDI ports", String::as_str)).width(280.0).show_ui(ui, |ui| {
@@ -663,14 +677,24 @@ impl RustDj {
             ui.label(RichText::new(self.midi.connected.as_deref().unwrap_or("No controller connected")).color(PURPLE));
             if let Some(error) = &self.midi.error { ui.colored_label(WARNING, error); }
             ui.horizontal(|ui| {
-                if ui.button("Load DJ-202 profile").clicked() { self.midi.bindings = midi::dj202_profile(); self.midi.dirty = true; }
-                ui.checkbox(&mut self.midi.dj202_leds, "DJ-202 transport/pad LEDs");
+                if ui.button("Reset profile").clicked() { self.midi.reset_profile(); }
+                if ui.button("Import JSON …").clicked() && let Some(path)=rfd::FileDialog::new().set_title("Import RustDJ controller profile").add_filter("RustDJ MIDI profile",&["json"]).pick_file() {
+                    match ProfileFile::read(&path) {
+                        Ok(file)=>{self.midi.choose_profile(Some(file.profile),ctx);self.midi.bindings=file.bindings;self.midi.save_current_profile();self.midi.dirty=true;},
+                        Err(error)=>self.midi.error=Some(error),
+                    }
+                }
+                if ui.button("Export JSON …").clicked() && let Some(path)=rfd::FileDialog::new().set_title("Export RustDJ controller profile").set_file_name("RustDJ-controller.json").add_filter("RustDJ MIDI profile",&["json"]).save_file() {
+                    let file=ProfileFile{schema_version:1,profile:self.midi.active_profile,bindings:self.midi.bindings.clone()};
+                    if let Err(error)=file.write(&path) { self.midi.error=Some(error); }
+                }
+                if ui.checkbox(&mut self.midi.dj202_leds, "MIDI LEDs (supported controls)").changed() {self.midi.dirty=true;}
             });
-            ui.label(RichText::new("Profile: Decks 1–4, mixer, filter/FX, transport, browser and all eight hotcue/loop pads. DECK 3/4 switches the controller banks.").small().color(MUTED));
-            ui.label("Press HOT CUE or LOOP on the DJ-202, then use pads 1–8.");
+            ui.label(RichText::new("Each model keeps its own learned mappings. Reset restores only the active profile. Unknown devices use Generic MIDI / Learn.").small().color(MUTED));
+            ui.label("Select the appropriate HOT CUE / LOOP mode before using performance pads.");
             ui.label(RichText::new("HOT CUE: empty = set, assigned = jump/play; SHIFT+pad = clear. LOOP: ¼ · ½ · 1 · 2 · 4 · 8 · 16 · 32 beats; press again to exit. PARAM −/+ halves/doubles the loop.").small());
             for (deck, mode) in self.midi.pad_modes.iter().enumerate() {
-                ui.label(RichText::new(format!("Deck {} · Pads: {}", deck + 1, mode.map_or("Select HOT CUE/LOOP on the controller", midi::PadMode::label))).small().color(PURPLE));
+                if self.midi.active_profile.banked() { ui.label(RichText::new(format!("Deck {} · Pads: {}", deck + 1, mode.map_or("Select HOT CUE/LOOP on the controller", midi::PadMode::label))).small().color(PURPLE)); }
             }
             ui.separator();
             ui.label(RichText::new("MIDI-LEARN").strong());
@@ -678,8 +702,9 @@ impl RustDj {
                 egui::ComboBox::from_id_salt("midi-action").selected_text(self.midi.learn_action.label()).show_ui(ui, |ui| {
                     for action in Action::all() { ui.selectable_value(&mut self.midi.learn_action, action, action.label()); }
                 });
-                egui::ComboBox::from_id_salt("midi-mode").selected_text(match self.midi.learn_mode { Mode::Relative64 => "Encoder: center 64", Mode::RelativeTwos => "Encoder: 1 / 127", _ => "Button / fader (7-bit)" }).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("midi-mode").selected_text(match self.midi.learn_mode { Mode::Absolute7Inverted => "Inverted fader (7-bit)", Mode::Relative64 => "Encoder: center 64", Mode::RelativeTwos => "Encoder: 1 / 127", _ => "Button / fader (7-bit)" }).show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.midi.learn_mode, Mode::Absolute7, "Button / fader (7-bit)");
+                    ui.selectable_value(&mut self.midi.learn_mode, Mode::Absolute7Inverted, "Inverted fader (7-bit)");
                     ui.selectable_value(&mut self.midi.learn_mode, Mode::Relative64, "Encoder: center 64");
                     ui.selectable_value(&mut self.midi.learn_mode, Mode::RelativeTwos, "Encoder: 1 / 127");
                 });
@@ -1340,6 +1365,7 @@ impl eframe::App for RustDj {
                     self.crossfader.enabled,
                 )
         {
+            self.midi.save_current_profile();
             let settings = Settings {
                 browser: self.browser.settings.clone(),
                 bindings: Some(self.midi.bindings.clone()),
@@ -1350,7 +1376,7 @@ impl eframe::App for RustDj {
                     mixing: self.mixing,
                     crossfader_enabled: self.crossfader.enabled,
                 },
-                mapping_version: 6,
+                mapping_version: 7,
                 midi: self.midi.prefs.clone(),
                 streamer: self.stream_settings.clone(),
                 master_eq: self.master_eq,

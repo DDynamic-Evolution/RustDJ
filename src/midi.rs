@@ -1,8 +1,10 @@
 //! MIDI input and a small DJ-202 profile. No device-specific code runs in the callback.
+use crate::controller_profiles::ProfileId;
 use eframe::egui;
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -95,7 +97,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn map_deck(self, map: impl FnOnce(usize) -> usize) -> Self {
+    pub(crate) fn map_deck(self, map: impl FnOnce(usize) -> usize) -> Self {
         match self {
             Self::Play(d) => Self::Play(map(d)),
             Self::Cue(d) => Self::Cue(map(d)),
@@ -280,9 +282,20 @@ pub enum Mode {
     Button,
     Gate,
     Absolute7,
+    Absolute7Inverted,
     Absolute14 { lsb: u8 },
+    Absolute14Inverted { lsb: u8 },
     Relative64,
     RelativeTwos,
+}
+
+impl Mode {
+    pub fn lsb(self) -> Option<u8> {
+        match self {
+            Self::Absolute14 { lsb } | Self::Absolute14Inverted { lsb } => Some(lsb),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -497,8 +510,7 @@ pub fn upgrade(mut bindings: Vec<Binding>) -> Vec<Binding> {
         if !original.contains(&binding.action)
             && !bindings.iter().any(|b| {
                 b.status == binding.status
-                    && (b.number == binding.number
-                        || matches!(b.mode, Mode::Absolute14 { lsb } if lsb == binding.number))
+                    && (b.number == binding.number || b.mode.lsb() == Some(binding.number))
             })
         {
             bindings.push(binding);
@@ -560,6 +572,7 @@ fn led_messages<const N: usize>(decks: [DeckLeds; N], synced: Option<usize>) -> 
 }
 
 pub struct Mapper {
+    profile: ProfileId,
     msb: [[u8; 128]; 16],
     layers: [usize; 2],
     cue_holds: Vec<(u8, u8, usize)>,
@@ -568,6 +581,7 @@ pub struct Mapper {
 impl Default for Mapper {
     fn default() -> Self {
         Self {
+            profile: ProfileId::RolandDj202,
             msb: [[0; 128]; 16],
             layers: [0, 1],
             cue_holds: Vec::with_capacity(4),
@@ -576,7 +590,16 @@ impl Default for Mapper {
 }
 
 impl Mapper {
+    fn for_profile(profile: ProfileId) -> Self {
+        Self {
+            profile,
+            ..Self::default()
+        }
+    }
     fn observe_deck(&mut self, [status, number, value]: [u8; 3]) {
+        if !self.profile.banked() {
+            return;
+        }
         // Native bank channels identify the deck, including when returning to
         // 1/2. Never reinterpret them through the last software layer. Releases
         // must not switch banks (Cue may still belong to the previous deck).
@@ -632,18 +655,34 @@ impl Mapper {
                     {
                         1.0
                     }
-                    Mode::Absolute7 if number == binding.number && status & 0xf0 == 0xb0 => {
-                        value as f32 / 127.0
+                    Mode::Absolute7 | Mode::Absolute7Inverted
+                        if number == binding.number && status & 0xf0 == 0xb0 =>
+                    {
+                        let value = value as f32 / 127.0;
+                        if binding.mode == Mode::Absolute7Inverted {
+                            1.0 - value
+                        } else {
+                            value
+                        }
                     }
-                    Mode::Absolute14 { lsb } if number == lsb && status & 0xf0 == 0xb0 => {
+                    Mode::Absolute14 { lsb } | Mode::Absolute14Inverted { lsb }
+                        if number == lsb && status & 0xf0 == 0xb0 =>
+                    {
                         let raw = ((self.msb[channel][binding.number as usize] as u16) << 7)
                             | value as u16;
-                        let max = if binding.action == Action::Crossfader {
+                        let max = if binding.action == Action::Crossfader
+                            && self.profile == ProfileId::RolandDj202
+                        {
                             16368.0
                         } else {
                             16383.0
                         };
-                        (raw as f32 / max).clamp(0.0, 1.0)
+                        let value = (raw as f32 / max).clamp(0.0, 1.0);
+                        if matches!(binding.mode, Mode::Absolute14Inverted { .. }) {
+                            1.0 - value
+                        } else {
+                            value
+                        }
                     }
                     Mode::Relative64 if number == binding.number && status & 0xf0 == 0xb0 => {
                         (value as i16 - 64) as f32
@@ -671,16 +710,19 @@ impl Mapper {
                 }
                 // Only shared hardware controls follow the selected bank. Native
                 // transport/mixer/pad channels and learned deck targets stay exact.
-                let shared = match action {
-                    Action::FxToggle(side, slot) if side < 2 && slot < 3 => {
-                        status == 0x98 + side as u8 && number == slot as u8
-                    }
-                    Action::FxLevel(side) if side < 2 => {
-                        status == 0xb8 + side as u8 && matches!(number, 0 | 3)
-                    }
-                    Action::Load(side) if side < 2 => status == 0x9f && number == 2 + side as u8,
-                    _ => false,
-                };
+                let shared = self.profile.banked()
+                    && match action {
+                        Action::FxToggle(side, slot) if side < 2 && slot < 3 => {
+                            status == 0x98 + side as u8 && number == slot as u8
+                        }
+                        Action::FxLevel(side) if side < 2 => {
+                            status == 0xb8 + side as u8 && matches!(number, 0 | 3)
+                        }
+                        Action::Load(side) if side < 2 => {
+                            status == 0x9f && number == 2 + side as u8
+                        }
+                        _ => false,
+                    };
                 let action = if shared {
                     action.map_deck(|side| self.layers[side])
                 } else {
@@ -689,7 +731,11 @@ impl Mapper {
                 let action = if let Action::Cue(deck) = action {
                     // The same physical Cue key can release on the new native deck
                     // channel after switching 1/3 or 2/4 while it is held.
-                    let hold_channel = if channel < 4 { channel % 2 } else { channel } as u8;
+                    let hold_channel = if self.profile.banked() && channel < 4 {
+                        channel % 2
+                    } else {
+                        channel
+                    } as u8;
                     if let Some(index) = self
                         .cue_holds
                         .iter()
@@ -720,12 +766,18 @@ impl Mapper {
 pub struct MidiPrefs {
     pub auto_connect: bool,
     pub preferred_port: Option<String>,
+    pub profile: Option<ProfileId>,
+    pub mappings: BTreeMap<ProfileId, Vec<Binding>>,
+    pub led_feedback: bool,
 }
 impl Default for MidiPrefs {
     fn default() -> Self {
         Self {
             auto_connect: true,
             preferred_port: None,
+            profile: None,
+            mappings: BTreeMap::new(),
+            led_feedback: true,
         }
     }
 }
@@ -744,6 +796,7 @@ fn is_dj202(name: &str) -> bool {
 }
 
 pub struct Midi {
+    pub active_profile: ProfileId,
     pub bindings: Vec<Binding>,
     pub ports: Vec<String>,
     pub selected_port: usize,
@@ -766,6 +819,8 @@ pub struct Midi {
     output: Option<MidiOutputConnection>,
     receiver: Option<Receiver<[u8; 3]>>,
     last_leds: Option<([DeckLeds; 4], [bool; 4], [usize; 2])>,
+    pending_actions: Vec<(Action, f32)>,
+    shifted: [bool; 4],
 }
 
 impl Midi {
@@ -775,9 +830,36 @@ impl Midi {
         midi
     }
 
-    fn unconnected(bindings: Option<Vec<Binding>>, prefs: MidiPrefs) -> Self {
+    fn unconnected(bindings: Option<Vec<Binding>>, mut prefs: MidiPrefs) -> Self {
+        let active_profile = prefs
+            .profile
+            .or_else(|| {
+                prefs
+                    .preferred_port
+                    .as_deref()
+                    .map(|name| ProfileId::detect(name).unwrap_or(ProfileId::Generic))
+            })
+            .unwrap_or(ProfileId::RolandDj202);
+        if prefs.mappings.is_empty()
+            && let Some(old) = bindings.as_ref()
+        {
+            prefs.mappings.insert(active_profile, old.clone());
+        }
+        let bindings = prefs
+            .mappings
+            .get(&active_profile)
+            .cloned()
+            .unwrap_or_else(|| {
+                if active_profile == ProfileId::RolandDj202 {
+                    bindings.unwrap_or_else(dj202_profile)
+                } else {
+                    active_profile.defaults()
+                }
+            });
+        let leds = prefs.led_feedback;
         Self {
-            bindings: bindings.unwrap_or_else(dj202_profile),
+            active_profile,
+            bindings,
             ports: Vec::new(),
             selected_port: 0,
             connected: None,
@@ -789,17 +871,116 @@ impl Midi {
             dirty: false,
             learn_action: Action::Play(0),
             learn_mode: Mode::Absolute7,
-            dj202_leds: true,
+            dj202_leds: leds,
             prefs,
             port_scan: None,
             last_scan: Instant::now(),
             last_retry: None,
-            mapper: Mapper::default(),
+            mapper: Mapper::for_profile(active_profile),
             input: None,
             output: None,
             receiver: None,
             last_leds: None,
+            pending_actions: Vec::new(),
+            shifted: [false; 4],
         }
+    }
+
+    pub fn save_current_profile(&mut self) {
+        self.prefs
+            .mappings
+            .insert(self.active_profile, self.bindings.clone());
+        self.prefs.led_feedback = self.dj202_leds;
+    }
+
+    fn release_cues(&mut self) {
+        self.pending_actions.extend(
+            self.mapper
+                .cue_holds
+                .drain(..)
+                .map(|(_, _, d)| (Action::Cue(d), 0.0)),
+        );
+    }
+
+    fn activate_profile(&mut self, profile: ProfileId) {
+        if profile == self.active_profile {
+            return;
+        }
+        self.save_current_profile();
+        self.release_cues();
+        self.active_profile = profile;
+        self.bindings = self
+            .prefs
+            .mappings
+            .get(&profile)
+            .cloned()
+            .unwrap_or_else(|| profile.defaults());
+        self.mapper = Mapper::for_profile(profile);
+        self.pad_modes = [None; 4];
+        self.shifted = [false; 4];
+        self.last_leds = None;
+        self.learning = None;
+        self.last_action = None;
+        self.dirty = true;
+    }
+
+    pub fn choose_profile(&mut self, choice: Option<ProfileId>, ctx: &egui::Context) {
+        let was_connected = self.connected.is_some();
+        let profile = choice
+            .or_else(|| self.connected.as_deref().and_then(ProfileId::detect))
+            .or_else(|| {
+                self.ports
+                    .get(self.selected_port)
+                    .and_then(|p| ProfileId::detect(p))
+            })
+            .unwrap_or(ProfileId::Generic);
+        self.prefs.profile = choice;
+        self.close_connection();
+        self.activate_profile(profile);
+        self.dirty = true;
+        if was_connected
+            && self.ports.get(self.selected_port).is_some_and(|p| {
+                profile == ProfileId::Generic
+                    || ProfileId::detect(p).is_none_or(|actual| actual == profile)
+            })
+        {
+            self.connect(ctx);
+        }
+    }
+
+    pub fn reset_profile(&mut self) {
+        self.release_cues();
+        self.bindings = self.active_profile.defaults();
+        self.mapper = Mapper::for_profile(self.active_profile);
+        self.pad_modes = [None; 4];
+        self.shifted = [false; 4];
+        self.learning = None;
+        self.last_leds = None;
+        self.dirty = true;
+        self.save_current_profile();
+    }
+
+    fn automatic_port(&self) -> Option<usize> {
+        if let Some(preferred) = self.prefs.preferred_port.as_ref() {
+            if self.prefs.profile.is_some_and(|selected| {
+                selected != ProfileId::Generic
+                    && ProfileId::detect(preferred).is_some_and(|actual| selected != actual)
+            }) {
+                return None;
+            }
+            return self.ports.iter().position(|p| p == preferred);
+        }
+        let candidates: Vec<_> = self
+            .ports
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| {
+                ProfileId::detect(name)
+                    .is_some_and(|p| self.prefs.profile.is_none_or(|selected| selected == p))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        (candidates.len() == 1).then(|| candidates[0])
     }
 
     pub fn refresh(&mut self) {
@@ -843,9 +1024,7 @@ impl Midi {
                             self.selected_port = selected
                                 .as_ref()
                                 .and_then(|name| self.ports.iter().position(|p| p == name))
-                                .or_else(|| {
-                                    auto_port(&self.ports, self.prefs.preferred_port.as_deref())
-                                })
+                                .or_else(|| self.automatic_port())
                                 .unwrap_or(0);
                         }
                         Err(error) => self.error = Some(format!("MIDI device scan: {error}")),
@@ -866,7 +1045,7 @@ impl Midi {
             && self
                 .last_retry
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
-            && let Some(index) = auto_port(&self.ports, self.prefs.preferred_port.as_deref())
+            && let Some(index) = self.automatic_port()
         {
             self.selected_port = index;
             self.connect(ctx);
@@ -888,6 +1067,11 @@ impl Midi {
             if self.ports.get(self.selected_port) != Some(&name) {
                 return Err("The MIDI port list changed. Please refresh it.".into());
             }
+            let profile = self
+                .prefs
+                .profile
+                .unwrap_or_else(|| ProfileId::detect(&name).unwrap_or(ProfileId::Generic));
+            self.activate_profile(profile);
             let (sender, receiver) = mpsc::sync_channel(512);
             let ctx = ctx.clone();
             self.input = Some(
@@ -908,25 +1092,35 @@ impl Midi {
             self.receiver = Some(receiver);
             // The output is also needed to unlock the pad layers, even with LEDs off.
             // Never send device-specific initialization to unrelated instruments.
-            if is_dj202(&name) {
+            if self.active_profile.matches(&name) {
                 let result = (|| -> Result<MidiOutputConnection, String> {
                     let output = MidiOutput::new("RustDJ LEDs").map_err(|e| e.to_string())?;
                     let ports = output.ports();
+                    let matching: Vec<_> = ports
+                        .iter()
+                        .filter(|p| {
+                            output
+                                .port_name(p)
+                                .is_ok_and(|n| self.active_profile.matches(&n))
+                        })
+                        .collect();
                     let port = ports
                         .iter()
                         .find(|p| output.port_name(p).is_ok_and(|n| n == name))
-                        .or_else(|| {
-                            ports
-                                .iter()
-                                .find(|p| output.port_name(p).is_ok_and(|n| is_dj202(&n)))
-                        })
-                        .ok_or("DJ-202 MIDI output is missing")?;
+                        .or_else(|| (matching.len() == 1).then(|| matching[0]))
+                        .ok_or("MIDI output is missing or ambiguous for the selected controller")?;
                     let mut connection = output
                         .connect(port, "RustDJ LEDs")
                         .map_err(|e| e.to_string())?;
-                    initialize_dj202(|message| {
-                        connection.send(message).map_err(|e| e.to_string())
-                    })?;
+                    if self.active_profile == ProfileId::RolandDj202 {
+                        initialize_dj202(|message| {
+                            connection.send(message).map_err(|e| e.to_string())
+                        })?;
+                    } else {
+                        for message in self.active_profile.initialization() {
+                            connection.send(message).map_err(|e| e.to_string())?;
+                        }
+                    }
                     Ok(connection)
                 })();
                 match result {
@@ -957,6 +1151,7 @@ impl Midi {
     }
 
     fn close_connection(&mut self) {
+        self.release_cues();
         self.input = None;
         self.output = None;
         self.receiver = None;
@@ -966,7 +1161,8 @@ impl Midi {
         self.last_message = None;
         self.last_action = None;
         self.learning = None;
-        self.mapper = Mapper::default();
+        self.mapper = Mapper::for_profile(self.active_profile);
+        self.shifted = [false; 4];
     }
 
     pub fn poll(&mut self) -> Vec<(Action, f32)> {
@@ -974,13 +1170,14 @@ impl Midi {
             .receiver
             .as_ref()
             .map_or(Vec::new(), |r| r.try_iter().take(512).collect());
-        let mut actions = Vec::new();
+        let mut actions = std::mem::take(&mut self.pending_actions);
         for message in messages {
             if matches!(message[0] & 0xf0, 0x80 | 0x90) {
                 self.last_leds = None;
             }
             self.last_message = Some(message);
-            if self.connected.as_deref().is_some_and(is_dj202)
+            if self.active_profile == ProfileId::RolandDj202
+                && self.connected.as_deref().is_some_and(is_dj202)
                 && let Some((deck, mode)) = pad_mode_message(message)
             {
                 self.mapper.observe_deck(message);
@@ -988,11 +1185,40 @@ impl Midi {
                 // Mode selection must not become a learned pad binding.
                 continue;
             }
+            let [status, number, value] = message;
+            let note = status & 0xf0;
+            if self.active_profile == ProfileId::NumarkMixtrackPro3
+                && matches!(status & 0xf, 1 | 2)
+                && matches!(note, 0x80 | 0x90)
+                && number == 0x0b
+            {
+                self.shifted[(status & 0xf) as usize - 1] = note == 0x90 && value > 0;
+                continue;
+            }
+            if matches!(
+                self.active_profile,
+                ProfileId::RolandDj505 | ProfileId::NumarkMixtrackPlatinumFx
+            ) && (0x94..=0x97).contains(&status)
+                && number <= 0x0f
+            {
+                if value > 0 {
+                    let d = (status - 0x94) as usize;
+                    self.mapper.layers[d % 2] = d;
+                    self.pad_modes[d] = Some(match number {
+                        0 => PadMode::Hotcue,
+                        0x0d => PadMode::Loop,
+                        n => PadMode::Other(n),
+                    });
+                }
+                continue;
+            }
             if let Some(action) = self.learning {
                 if let Some(binding) = learn_binding(action, self.learn_mode, message) {
                     self.bindings.retain(|b| {
                         b.action != action
-                            && !(b.status == binding.status && (b.number == binding.number || matches!(b.mode, Mode::Absolute14 { lsb } if lsb == binding.number)))
+                            && !(b.status == binding.status
+                                && (b.number == binding.number
+                                    || b.mode.lsb() == Some(binding.number)))
                     });
                     self.bindings.push(binding);
                     self.learning = None;
@@ -1000,7 +1226,36 @@ impl Midi {
                 }
                 continue;
             }
-            let decoded = self.mapper.decode(message, &self.bindings);
+            let mut decoded = self.mapper.decode(message, &self.bindings);
+            if self.active_profile == ProfileId::NumarkMixtrackPro3 {
+                for (action, _) in &mut decoded {
+                    if let Action::Hotcue(d, s) = *action
+                        && self.shifted.get(d).copied().unwrap_or(false)
+                    {
+                        *action = Action::ClearHotcue(d, s);
+                    }
+                }
+            }
+            if matches!(
+                self.active_profile,
+                ProfileId::RolandDj505 | ProfileId::NumarkMixtrackPlatinumFx
+            ) && (0x94..=0x97).contains(&status)
+                && (0x14..=0x23).contains(&number)
+            {
+                let mode = self.pad_modes[(status - 0x94) as usize];
+                decoded.retain_mut(|(action, _)| match *action {
+                    Action::Hotcue(d, s) => match mode {
+                        Some(PadMode::Hotcue) => true,
+                        Some(PadMode::Loop) => {
+                            *action = Action::LoopPad(d, s);
+                            true
+                        }
+                        _ => false,
+                    },
+                    Action::ClearHotcue(..) => mode == Some(PadMode::Hotcue),
+                    _ => true,
+                });
+            }
             if let Some((action, _)) = decoded.last() {
                 self.last_action = Some(*action);
             }
@@ -1011,11 +1266,22 @@ impl Midi {
 
     pub fn feedback(&mut self, decks: [DeckLeds; 4], synced: [bool; 4]) {
         let state = (decks, synced, self.mapper.layers);
-        if !self.dj202_leds || self.last_leds == Some(state) {
+        if !self.dj202_leds
+            || self.last_leds == Some(state)
+            || !self
+                .connected
+                .as_deref()
+                .is_some_and(|name| self.active_profile.matches(name))
+        {
             return;
         }
         if let Some(output) = &mut self.output {
-            for message in all_led_messages(decks, synced, self.mapper.layers) {
+            let messages = if self.active_profile == ProfileId::RolandDj202 {
+                all_led_messages(decks, synced, self.mapper.layers)
+            } else {
+                crate::controller_profiles::basic_leds(self.active_profile, decks, synced)
+            };
+            for message in messages {
                 if let Err(error) = output.send(&message) {
                     self.error = Some(format!("LED output failed: {error}"));
                     return;
@@ -1036,7 +1302,13 @@ pub fn learn_binding(action: Action, learn_mode: Mode, message: [u8; 3]) -> Opti
         0xb0 if matches!(action, Action::Cue(_)) => Mode::Gate,
         0x90 if value > 0 && !action.continuous() => Mode::Button,
         0xb0 if matches!(learn_mode, Mode::Relative64 | Mode::RelativeTwos) => learn_mode,
-        0xb0 if action.continuous() => Mode::Absolute7,
+        0xb0 if action.continuous() => {
+            if learn_mode == Mode::Absolute7Inverted {
+                Mode::Absolute7Inverted
+            } else {
+                Mode::Absolute7
+            }
+        }
         0xb0 if value >= 64 => Mode::Button,
         _ => return None,
     };
@@ -1047,6 +1319,9 @@ pub fn learn_binding(action: Action, learn_mode: Mode, message: [u8; 3]) -> Opti
         action,
     })
 }
+
+#[cfg(test)]
+mod profile_tests;
 
 #[cfg(test)]
 mod tests {

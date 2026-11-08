@@ -1,4 +1,4 @@
-# RustDJ 0.20
+# RustDJ 0.21
 
 RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
@@ -18,7 +18,8 @@ The interface, tooltips, dialogs and application messages are in English.
 - Per-deck gain, three-band EQ, channel fader, headphone cue, filter and effects.
 - A switchable crossfader and an additional saved 10-band master equalizer.
 - Independent master and headphone output devices/channel pairs with stereo meters.
-- Roland DJ-202 auto-connect, four-deck MIDI banks, pad support, LEDs and MIDI learn.
+- Model-specific Pioneer, Roland and Numark profiles, auto-connect, saved custom
+  mappings, JSON import/export, MIDI learn and supported LED feedback.
 - SHOUTcast-compatible broadcasting with verified TLS, optional HTTPS track titles
   and independent MP3 recording.
 
@@ -195,7 +196,37 @@ Different sound cards and Bluetooth devices may have different latencies.
 RustDJ tracks both playback clocks and corrects headphone drift without moving
 the public master. Stop streaming and recording before changing audio routing.
 
-## Roland DJ-202 and other MIDI controllers
+## Controller profiles and MIDI
+
+**Controller / MIDI** provides model-specific presets for Pioneer DDJ-400 and
+DDJ-FLX4, Roland DJ-202 and DJ-505, Numark Mixtrack (Pro) 3 and Mixtrack Platinum
+FX. **Generic MIDI / Learn** starts without assumed manufacturer addresses.
+See [CONTROLLERS.md](CONTROLLERS.md) for the exact scope and source references.
+
+Choose **Automatic (known models)** or select a profile explicitly. Automatic
+connection uses a saved preferred port, or exactly one matching supported device.
+If several supported devices are present, choose a port manually. Unknown devices
+are not auto-connected; when connected manually they use Generic MIDI / Learn.
+
+Every model keeps its own learned bindings, including empty mappings. Switching
+profiles preserves changes and releases held Cue controls. **Reset profile**
+restores only the selected model's defaults. **Export JSON …** saves a RustDJ
+profile and **Import JSON …** loads a validated one. Import rejects unsupported
+versions, overlapping addresses, invalid deck/pad indices and oversized files.
+The format is specific to RustDJ; Mixxx XML and rekordbox presets are not imported.
+
+Initialization and LED output are sent only when the selected profile matches
+the actual port's model. Pioneer and Numark cannot accidentally receive Roland's
+pad unlock commands. Each profile uses its documented resolution, relative
+encoder format and tempo direction. Audio routing remains a separate setting;
+choose sound cards and channel pairs in **Audio / Outputs**.
+
+These are USB MIDI presets with automated message tests, not a guarantee that
+every hardware function is supported. HID-only equipment, DVS, proprietary jog
+displays, hardware sequencers and standalone analog mixer paths are not covered.
+Physical verification of the additional models remains outstanding.
+
+### Existing Roland DJ-202 support
 
 RustDJ automatically discovers the DJ-202 and reconnects after USB disconnection.
 **Controller / MIDI** allows manual device selection, connection, disconnection,
@@ -220,7 +251,7 @@ the reported pad mode in the MIDI window. Initialization/output errors are shown
 **MIDI-LEARN** supports assigning actions to other controls. Select an action,
 choose the appropriate button/fader or relative-encoder mode, click **Learn**,
 and move or press the control. The last MIDI bytes and action help diagnose
-assignments. **Load DJ-202 profile** replaces mappings with the default profile.
+assignments. **Reset profile** restores defaults for the active model.
 
 The DJ-202's physical MASTER LEVEL is a hardware output control; a software MIDI
 CC is not invented for it. Use RustDJ's MASTER control when sending to another
@@ -334,17 +365,16 @@ cd RustDJ
 With a regular Rust installation, `cargo run` and `cargo build --release` also
 work. `dev.ps1` uses an existing local `.tools` toolchain when available.
 
-The two targeted security regression tests for version 0.20 run with:
+The two targeted controller regression tests for version 0.21 run with:
 
 ```powershell
-cargo test --lib tls20_
+cargo test --lib profiles21_
 ```
 
-They use real local TLS 1.2/1.3 peers and capture raw network bytes. Checks cover
-source/audio and metadata delivery, trusted certificates, untrusted/expired/
-wrong-host rejection before credentials, plaintext peers without downgrade,
-handshake cancellation and secure migration of older settings. No public
-SHOUTcast server or real streaming password is used in these checks.
+They exercise all preset bindings, 7/14-bit and inverted controls, held Cue,
+model isolation, pad modes, legacy settings, independent custom mappings,
+JSON import/export validation and device detection. Existing TLS security
+regressions remain available through `cargo test --lib tls20_`.
 The MIDI bank regression can also be run with `cargo test --lib regression18_native`.
 A full test run is available through `cargo test` or `.\dev.ps1 test`.
 The hardware audio test is ignored by default and can be requested with
