@@ -1,10 +1,17 @@
-# RustDJ 0.21
+<p align="center">
+  <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
+</p>
+
+# RustDJ 0.22
 
 RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
 streaming and MP3 recording in one desktop application.
 
 The interface, tooltips, dialogs and application messages are in English.
+The violet RustDJ logo appears in the header. The application icon is embedded
+in both the window and the Windows executable, with multiple sizes for Explorer
+and the taskbar. No external image files are needed to run the EXE.
 
 ## Features
 
@@ -396,6 +403,7 @@ The `work/` folder is used for local checks and packaging and is not committed.
 | Module | Purpose |
 | --- | --- |
 | `app`, `browser`, `playlist`, `dragdrop` | Desktop UI and library workflow |
+| `branding`, `assets/branding`, `build.rs` | Embedded logo, window icon and Windows executable resources |
 | `audio`, `output`, `dsp`, `effects`, `equalizer`, `loops` | Playback, routing and signal processing |
 | `midi`, `decks` | Controller mapping and deck identity |
 | `track`, `analysis`, `beat`, `key`, `waveform` | Decoding and track analysis |

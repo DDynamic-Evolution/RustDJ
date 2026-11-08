@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod app;
 pub mod audio;
 pub mod beat;
+pub mod branding;
 pub mod browser;
 pub mod capture;
 pub mod controller_profiles;

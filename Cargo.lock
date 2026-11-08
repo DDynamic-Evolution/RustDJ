@@ -2763,9 +2763,10 @@ dependencies = [
 
 [[package]]
 name = "rustdj"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "eframe",
+ "find-msvc-tools",
  "flate2",
  "midir",
  "mp3lame-encoder",

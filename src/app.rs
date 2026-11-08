@@ -70,6 +70,7 @@ impl Crossfader {
 }
 
 pub struct RustDj {
+    logo: egui::TextureHandle,
     decks: [Deck; COUNT],
     audio: Audio,
     crossfader: Crossfader,
@@ -143,6 +144,7 @@ impl RustDj {
                 Err(error) => (String::new(), Some(error)),
             };
         Self {
+            logo: crate::branding::logo(ctx),
             decks: std::array::from_fn(|_| Deck::default()),
             audio,
             crossfader: Crossfader::new(settings.mix.crossfader_enabled),
@@ -234,9 +236,12 @@ impl RustDj {
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("RUST").size(21.0).strong());
-            ui.label(RichText::new("DJ").size(21.0).strong().color(PURPLE));
-            ui.label(RichText::new("0.21 / 4 DECKS").size(10.0).color(MUTED));
+            ui.add(egui::Image::new((self.logo.id(), Vec2::new(120.0, 40.0))).alt_text("RustDJ"));
+            ui.label(
+                RichText::new(concat!(env!("CARGO_PKG_VERSION"), " / 4 DECKS"))
+                    .size(10.0)
+                    .color(MUTED),
+            );
             ui.separator();
             let midi =
                 controller_status(self.midi.connected.as_deref(), self.midi.prefs.auto_connect);
@@ -1107,7 +1112,7 @@ impl eframe::App for RustDj {
         self.midi_actions(ctx);
         self.shortcuts(ctx);
         egui::TopBottomPanel::top("app-header")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
+            .frame(egui::Frame::new().fill(BG).inner_margin(6.0))
             .show(ctx, |ui| {
                 self.header(ui, ctx);
             });
