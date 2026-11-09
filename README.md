@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.22
+# RustDJ 0.23
 
 RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
@@ -30,6 +30,8 @@ and the taskbar. No external image files are needed to run the EXE.
 - Independent master and headphone output devices/channel pairs with stereo meters.
 - Model-specific Pioneer, Roland and Numark profiles, auto-connect, saved custom
   mappings, JSON import/export, MIDI learn and supported LED feedback.
+- Original Pioneer DDJ-SX profile with four native decks, mixer, hotcues,
+  direct loop pads and banked FX; see [DDJ-SX setup](CONTROLLERS.md#pioneer-ddj-sx-setup).
 - SHOUTcast-compatible broadcasting with verified TLS, optional HTTPS track titles
   and independent MP3 recording.
 
@@ -208,8 +210,8 @@ the public master. Stop streaming and recording before changing audio routing.
 
 ## Controller profiles and MIDI
 
-**Controller / MIDI** provides model-specific presets for Pioneer DDJ-400 and
-DDJ-FLX4, Roland DJ-202 and DJ-505, Numark Mixtrack (Pro) 3 and Mixtrack Platinum
+**Controller / MIDI** provides model-specific presets for Pioneer DDJ-400,
+DDJ-FLX4 and DDJ-SX, Roland DJ-202 and DJ-505, Numark Mixtrack (Pro) 3 and Mixtrack Platinum
 FX. **Generic MIDI / Learn** starts without assumed manufacturer addresses.
 See [CONTROLLERS.md](CONTROLLERS.md) for the exact scope and source references.
 
@@ -375,15 +377,16 @@ cd RustDJ
 With a regular Rust installation, `cargo run` and `cargo build --release` also
 work. `dev.ps1` uses an existing local `.tools` toolchain when available.
 
-The two targeted controller regression tests for version 0.21 run with:
+The two targeted DDJ-SX regression tests for version 0.23 run with:
 
 ```powershell
-cargo test --lib profiles21_
+cargo test --lib sx23_
 ```
 
-They exercise all preset bindings, 7/14-bit and inverted controls, held Cue,
-model isolation, pad modes, legacy settings, independent custom mappings,
-JSON import/export validation and device detection. Existing TLS security
+They include the existing controller-profile regressions and exercise all
+preset bindings, native SX deck/pad channels, 14-bit mixer/filter/tempo,
+FX bank isolation, Cue release after deck/profile changes, saved mappings,
+JSON import/export and model detection (including SX2/SX3 exclusion). Existing TLS security
 regressions remain available through `cargo test --lib tls20_`.
 The MIDI bank regression can also be run with `cargo test --lib regression18_native`.
 A full test run is available through `cargo test` or `.\dev.ps1 test`.

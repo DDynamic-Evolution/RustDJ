@@ -9,15 +9,17 @@ pub enum ProfileId {
     RolandDj505,
     PioneerDdj400,
     PioneerDdjFlx4,
+    PioneerDdjSx,
     NumarkMixtrackPro3,
     NumarkMixtrackPlatinumFx,
     Generic,
 }
 
 impl ProfileId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PioneerDdj400,
         Self::PioneerDdjFlx4,
+        Self::PioneerDdjSx,
         Self::RolandDj202,
         Self::RolandDj505,
         Self::NumarkMixtrackPro3,
@@ -30,6 +32,7 @@ impl ProfileId {
             Self::RolandDj505 => "Roland DJ-505",
             Self::PioneerDdj400 => "Pioneer DDJ-400",
             Self::PioneerDdjFlx4 => "Pioneer DDJ-FLX4",
+            Self::PioneerDdjSx => "Pioneer DDJ-SX",
             Self::NumarkMixtrackPro3 => "Numark Mixtrack (Pro) 3",
             Self::NumarkMixtrackPlatinumFx => "Numark Mixtrack Platinum FX",
             Self::Generic => "Generic MIDI / Learn",
@@ -45,6 +48,9 @@ impl ProfileId {
             }
             Self::PioneerDdj400 | Self::PioneerDdjFlx4 => {
                 "USB MIDI, two decks, 14-bit mixer/tempo, hotcues and beat-loop pads. Shared Beat FX, proprietary features and HID are not mapped."
+            }
+            Self::PioneerDdjSx => {
+                "Four native decks, 14-bit mixer/tempo/filter, hotcues, ROLL pads as beat loops and banked FX. Use the other-software MIDI utility mode. Hardware output levels and FX assignment switches are not mapped."
             }
             Self::NumarkMixtrackPro3 => {
                 "Two decks, mixer, tempo, four hotcues and four loop pads. This model has no hardware trim knob. SHIFT+hotcue clears it."
@@ -68,6 +74,7 @@ impl ProfileId {
             (Self::RolandDj505, "dj505"),
             (Self::PioneerDdj400, "ddj400"),
             (Self::PioneerDdjFlx4, "ddjflx4"),
+            (Self::PioneerDdjSx, "ddjsx"),
             (Self::NumarkMixtrackPro3, "mixtrackpro3"),
             (Self::NumarkMixtrackPro3, "mixtrack3"),
             (Self::NumarkMixtrackPlatinumFx, "mixtrackplatinumfx"),
@@ -86,7 +93,10 @@ impl ProfileId {
     pub fn banked(self) -> bool {
         matches!(
             self,
-            Self::RolandDj202 | Self::RolandDj505 | Self::NumarkMixtrackPlatinumFx
+            Self::RolandDj202
+                | Self::RolandDj505
+                | Self::NumarkMixtrackPlatinumFx
+                | Self::PioneerDdjSx
         )
     }
     pub fn matches(self, port: &str) -> bool {
@@ -97,6 +107,7 @@ impl ProfileId {
             Self::RolandDj202 => crate::midi::dj202_profile(),
             Self::RolandDj505 | Self::NumarkMixtrackPlatinumFx => banked(self),
             Self::PioneerDdj400 | Self::PioneerDdjFlx4 => pioneer(self),
+            Self::PioneerDdjSx => pioneer_sx(),
             Self::NumarkMixtrackPro3 => mixtrack3(),
             Self::Generic => Vec::new(),
         }
@@ -200,6 +211,72 @@ fn pioneer(model: ProfileId) -> Vec<Binding> {
     cc14(&mut out, 0xb6, 0x08, 0x28, A::Master);
     add(&mut out, 0xb6, 0x40, M::RelativeTwos, A::Browse);
     note(&mut out, 0x96, 0x41, A::Open);
+    out
+}
+
+fn pioneer_sx() -> Vec<Binding> {
+    let mut out = Vec::new();
+    for d in 0..4 {
+        let n = 0x90 + d as u8;
+        let cc = 0xb0 + d as u8;
+        for (number, action) in [
+            (0x0b, A::Play(d)),
+            (0x0c, A::Cue(d)),
+            (0x58, A::Sync(d)),
+            (0x54, A::Pfl(d)),
+            (0x72, A::SelectDeck(d)),
+            (0x14, A::LoopToggle(d)),
+            (0x50, A::Reloop(d)),
+            (0x10, A::LoopIn(d)),
+            (0x11, A::LoopOut(d)),
+            (0x4d, A::LoopExit(d)),
+            (0x12, A::LoopHalf(d)),
+            (0x13, A::LoopDouble(d)),
+        ] {
+            note(&mut out, n, number, action);
+        }
+        for (number, action) in [
+            (0, A::Tempo(d)),
+            (5, A::Tempo(d)), // SHIFT + tempo has a separate 14-bit pair.
+            (4, A::Gain(d)),
+            (7, A::EqHigh(d)),
+            (11, A::EqMid(d)),
+            (15, A::EqLow(d)),
+            (19, A::Volume(d)),
+        ] {
+            cc14(&mut out, cc, number, number + 32, action);
+        }
+        for number in [0x1f, 0x21, 0x22, 0x23, 0x26] {
+            add(&mut out, cc, number, M::Relative64, A::Jog(d));
+        }
+        cc14(&mut out, 0xb6, 0x17 + d as u8, 0x37 + d as u8, A::Filter(d));
+        note(&mut out, 0x96, 0x46 + d as u8, A::Load(d));
+        // Unlike DDJ-400/FLX4, every SX deck has one pad channel, with
+        // shifted hotcues and pad modes encoded in the note number.
+        for slot in 0..8 {
+            let pad = 0x97 + d as u8;
+            note(&mut out, pad, slot as u8, A::Hotcue(d, slot));
+            note(&mut out, pad, 8 + slot as u8, A::ClearHotcue(d, slot));
+            for base in [0x10, 0x50] {
+                note(&mut out, pad, base + slot as u8, A::LoopPad(d, slot));
+            }
+        }
+    }
+    cc14(&mut out, 0xb6, 0x1f, 0x3f, A::Crossfader);
+    add(&mut out, 0xb6, 0x40, M::RelativeTwos, A::Browse);
+    note(&mut out, 0x96, 0x41, A::Open);
+    for side in 0..2 {
+        for slot in 0..3 {
+            note(
+                &mut out,
+                0x94 + side as u8,
+                0x47 + slot as u8,
+                A::FxToggle(side, slot),
+            );
+        }
+        // RustDJ has one FX depth per deck; the first FX knob controls it.
+        cc14(&mut out, 0xb4 + side as u8, 0x02, 0x22, A::FxLevel(side));
+    }
     out
 }
 
@@ -380,7 +457,7 @@ pub(crate) fn basic_leds(
     }
     for d in 0..count {
         let (status, play, sync, pfl_status, pfl) = match profile {
-            ProfileId::PioneerDdj400 | ProfileId::PioneerDdjFlx4 => {
+            ProfileId::PioneerDdj400 | ProfileId::PioneerDdjFlx4 | ProfileId::PioneerDdjSx => {
                 (0x90 + d as u8, 0x0b, 0x58, 0x90 + d as u8, 0x54)
             }
             ProfileId::NumarkMixtrackPro3 => (0x91 + d as u8, 1, 2, 0x90, 0x0e + d as u8),
@@ -392,6 +469,19 @@ pub(crate) fn basic_leds(
             (pfl_status, pfl, decks[d].pfl),
         ] {
             messages.push([st, n, if on { 127 } else { 0 }]);
+        }
+    }
+    if profile == ProfileId::PioneerDdjSx {
+        for (d, deck) in decks.iter().enumerate() {
+            for slot in 0..8 {
+                for (base, on) in [
+                    (0, deck.hotcues[slot]),
+                    (0x10, deck.loops[slot]),
+                    (0x50, deck.loops[slot]),
+                ] {
+                    messages.push([0x97 + d as u8, base + slot as u8, if on { 127 } else { 0 }]);
+                }
+            }
         }
     }
     messages

@@ -600,6 +600,21 @@ impl Mapper {
         if !self.profile.banked() {
             return;
         }
+        if self.profile == ProfileId::PioneerDdjSx {
+            let deck = match status {
+                0x90..=0x93 if value > 0 && !matches!(number, 0x54 | 0x68 | 0x16 | 0x18 | 0x1d) => {
+                    status - 0x90
+                }
+                0x97..=0x9a if value > 0 => status - 0x97,
+                0xb0..=0xb3 if matches!(number, 0 | 5 | 0x1f | 0x21 | 0x22 | 0x23 | 0x26) => {
+                    status - 0xb0
+                }
+                _ => return,
+            } as usize;
+            // Moving another channel's EQ/fader must not select its deck for FX.
+            self.layers[deck % 2] = deck;
+            return;
+        }
         // Native bank channels identify the deck, including when returning to
         // 1/2. Never reinterpret them through the last software layer. Releases
         // must not switch banks (Cue may still belong to the previous deck).
@@ -710,19 +725,31 @@ impl Mapper {
                 }
                 // Only shared hardware controls follow the selected bank. Native
                 // transport/mixer/pad channels and learned deck targets stay exact.
-                let shared = self.profile.banked()
-                    && match action {
+                let shared = if self.profile == ProfileId::PioneerDdjSx {
+                    match action {
                         Action::FxToggle(side, slot) if side < 2 && slot < 3 => {
-                            status == 0x98 + side as u8 && number == slot as u8
+                            status == 0x94 + side as u8 && number == 0x47 + slot as u8
                         }
                         Action::FxLevel(side) if side < 2 => {
-                            status == 0xb8 + side as u8 && matches!(number, 0 | 3)
-                        }
-                        Action::Load(side) if side < 2 => {
-                            status == 0x9f && number == 2 + side as u8
+                            status == 0xb4 + side as u8 && matches!(number, 0x02 | 0x22)
                         }
                         _ => false,
-                    };
+                    }
+                } else {
+                    self.profile.banked()
+                        && match action {
+                            Action::FxToggle(side, slot) if side < 2 && slot < 3 => {
+                                status == 0x98 + side as u8 && number == slot as u8
+                            }
+                            Action::FxLevel(side) if side < 2 => {
+                                status == 0xb8 + side as u8 && matches!(number, 0 | 3)
+                            }
+                            Action::Load(side) if side < 2 => {
+                                status == 0x9f && number == 2 + side as u8
+                            }
+                            _ => false,
+                        }
+                };
                 let action = if shared {
                     action.map_deck(|side| self.layers[side])
                 } else {
