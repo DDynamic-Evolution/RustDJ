@@ -515,7 +515,20 @@ impl RustDj {
         }
     }
 
+    fn flush_jogs(&mut self, jogs: &mut [f32; COUNT]) {
+        for (d, ticks) in jogs.iter_mut().enumerate() {
+            let ticks = std::mem::take(ticks);
+            if ticks != 0.0 {
+                self.synced[d] = None;
+                if let Some(position) = self.decks[d].jog(ticks, Instant::now()) {
+                    self.decks[d].seek(position, &self.audio);
+                }
+            }
+        }
+    }
+
     fn midi_actions(&mut self, ctx: &egui::Context) {
+        let mut jogs = [0.0; COUNT];
         for (action, value) in self.midi.poll() {
             // Ignore out-of-range deck IDs in user-edited mapping files.
             let deck = match action {
@@ -553,6 +566,12 @@ impl RustDj {
             if deck.is_some_and(|d| d >= COUNT) {
                 continue;
             }
+            if let Action::Jog(d) = action {
+                jogs[d] += value;
+                continue;
+            }
+            // Apply pending turns before a transport action can read/change position.
+            self.flush_jogs(&mut jogs);
             match action {
                 Action::SelectDeck(d) => self.active = d,
                 Action::DeckLayer(_) => {}
@@ -568,14 +587,7 @@ impl RustDj {
                         self.synced[d] = None;
                     }
                 }
-                Action::Jog(d) => {
-                    if self.synced[d].is_some() {
-                        self.synced[d] = None;
-                    }
-                    let position =
-                        (self.decks[d].position().as_secs_f64() + value as f64 * 0.015).max(0.0);
-                    self.decks[d].seek(Duration::from_secs_f64(position), &self.audio);
-                }
+                Action::Jog(_) => unreachable!(),
                 Action::Load(d) => {
                     if let Some(path) = self.browser.selected_path() {
                         self.decks[d].load(path, ctx.clone());
@@ -649,6 +661,7 @@ impl RustDj {
                 }
             }
         }
+        self.flush_jogs(&mut jogs);
     }
 
     fn controller_ui(&mut self, ctx: &egui::Context) {
@@ -1076,6 +1089,7 @@ fn channel_pair_ui(
 
 impl eframe::App for RustDj {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let meter_decay = 0.86_f32.powf(ctx.input(|i| i.unstable_dt.max(0.0)) / 0.033);
         let levels_before = (
             self.master,
             self.phones,
@@ -1085,8 +1099,9 @@ impl eframe::App for RustDj {
         let (master_peaks, phones_peaks) = self.audio.levels();
         for (bus, peaks) in [master_peaks, phones_peaks].into_iter().enumerate() {
             for (channel, value) in peaks.into_iter().enumerate() {
-                self.bus_levels[bus][channel] =
-                    value.max(self.bus_levels[bus][channel] * 0.86).min(8.0);
+                self.bus_levels[bus][channel] = value
+                    .max(self.bus_levels[bus][channel] * meter_decay)
+                    .min(8.0);
             }
         }
         if let Some(error) = self.hotcue_store.error() {
@@ -1322,8 +1337,9 @@ impl eframe::App for RustDj {
             }
         }
         let gains = self.mix_gains();
+        let now = Instant::now();
         for (index, deck) in self.decks.iter_mut().enumerate() {
-            deck.apply_buses(gains.master[index], gains.phones[index]);
+            deck.apply_buses_at(gains.master[index], gains.phones[index], meter_decay, now);
             if let Some(snapshot) = deck.take_hotcue_changes() {
                 self.hotcue_store.save(snapshot);
             }
@@ -1393,7 +1409,11 @@ impl eframe::App for RustDj {
             self.midi.dirty = false;
             self.audio_dirty = false;
         }
-        ctx.request_repaint_after(Duration::from_millis(33));
+        if self.decks.iter().any(Deck::playing) {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
     }
 }
 
@@ -2123,17 +2143,16 @@ impl RustDj {
                     );
                 }
                 let pixels = rect.width().ceil().max(1.0) as usize;
-                for x in 0..pixels {
-                    let start = position + (x as f64 / pixels as f64 - 0.5) * window;
-                    let end = start + window / pixels as f64;
-                    if let Some(frame) = track.detailed.sample(start, end) {
-                        spectral_column(
-                            &painter,
-                            rect,
-                            rect.left() + x as f32 + 0.5,
-                            frame,
-                            x < pixels / 2,
-                        );
+                let step = window / pixels as f64;
+                // Keep the waveform bins anchored in track time as they scroll.
+                let left = position - window * 0.5;
+                let first = (left / step).floor();
+                for column in 0..=pixels {
+                    let start = (first + column as f64) * step;
+                    if let Some(frame) = track.detailed.sample(start, start + step) {
+                        let x = rect.left()
+                            + (((start + step * 0.5 - left) / window) as f32 * rect.width());
+                        spectral_column(&painter, rect, x, frame, x < rect.center().x);
                     }
                 }
                 if let Some(grid) = deck.grid {
@@ -2176,10 +2195,9 @@ impl RustDj {
                 FontId::proportional(12.0),
                 colour,
             );
-            if response.dragged() {
-                let time = (position
-                    - response.drag_delta().x as f64 / rect.width() as f64 * window)
-                    .max(0.0);
+            let delta = response.drag_delta().x;
+            if response.dragged() && delta != 0.0 {
+                let time = (position - delta as f64 / rect.width() as f64 * window).max(0.0);
                 deck.seek(Duration::from_secs_f64(time), &self.audio);
             }
         }

@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.23
+# RustDJ 0.23.1
 
 RustDJ is a native DJ application for Windows, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
@@ -178,6 +178,9 @@ the beat at the current position. Tempo ranges from 50% to 200%. Sync chooses
 another loaded deck as reference, preferring a playing deck with a higher master
 contribution. Multiple decks can follow a reference. Manual tempo changes,
 jogging, hotcue jumps and loop jumps release that deck's Sync relationship.
+During playback, a jogwheel turn briefly speeds up or slows down its deck and
+then returns to the selected tempo. On a paused deck, turning the wheel moves
+the cueing position by 15 ms per MIDI tick.
 
 ## Audio outputs and headphone monitoring
 

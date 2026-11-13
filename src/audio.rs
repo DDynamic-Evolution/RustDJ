@@ -77,9 +77,46 @@ pub struct Deck {
     loop_job: Option<LoopJob>,
     loop_buffer: Option<Arc<LoopBuffer>>,
     eq_params: Arc<EqParams>,
+    jog_bend: Option<JogBend>,
     cue_latch: CueLatch,
     sink: Option<Playback>,
     job: Option<LoadJob>,
+}
+
+struct JogBend {
+    started: Instant,
+    initial: f32,
+    peak: f32,
+}
+
+impl JogBend {
+    const ATTACK: f32 = 0.024;
+    const RELEASE: f32 = 0.160;
+
+    fn new(previous: Option<&Self>, ticks: f32, now: Instant) -> Self {
+        let initial = previous.map_or(0.0, |bend| bend.offset(now));
+        let carry = if initial * ticks > 0.0 { initial } else { 0.0 };
+        Self {
+            started: now,
+            initial,
+            peak: (carry + ticks * 0.04).clamp(-0.12, 0.12),
+        }
+    }
+
+    fn offset(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
+        let (from, to, progress) = if elapsed < Self::ATTACK {
+            (self.initial, self.peak, elapsed / Self::ATTACK)
+        } else {
+            (
+                self.peak,
+                0.0,
+                ((elapsed - Self::ATTACK) / Self::RELEASE).min(1.0),
+            )
+        };
+        let smooth = progress * progress * (3.0 - 2.0 * progress);
+        from + (to - from) * smooth
+    }
 }
 
 struct Voice {
@@ -237,6 +274,7 @@ impl Default for Deck {
             loop_job: None,
             loop_buffer: None,
             eq_params: Arc::new(EqParams::default()),
+            jog_bend: None,
             cue_latch: CueLatch::default(),
             sink: None,
             job: None,
@@ -311,6 +349,7 @@ impl Deck {
                     self.hotcues_dirty = false;
                     self.sink = sink;
                     self.cue = Duration::ZERO;
+                    self.jog_bend = None;
                     self.cue_latch = CueLatch::default();
                     self.ui_cue_down = false;
                     self.speed = 1.0;
@@ -419,6 +458,7 @@ impl Deck {
             return;
         }
         if self.playing() {
+            self.jog_bend = None;
             if let Some(sink) = &self.sink {
                 sink.pause();
             }
@@ -453,6 +493,7 @@ impl Deck {
     }
 
     pub fn seek(&mut self, position: Duration, audio: &Audio) {
+        self.jog_bend = None;
         if (self.loop_active || self.loop_pending())
             && self
                 .loop_range
@@ -466,10 +507,25 @@ impl Deck {
         let duration = self.track.as_ref().map_or(Duration::ZERO, |t| t.duration);
         // Keep the decoder alive when the user clicks the far right edge.
         let target = position.min(duration.saturating_sub(Duration::from_millis(1)));
-        if let Some(sink) = &self.sink
-            && let Err(error) = sink.seek_media(target)
-        {
-            self.error = Some(format!("Could not set playback position: {error}"));
+        if let Some(sink) = &self.sink {
+            sink.set_speed(self.speed);
+            if let Err(error) = sink.seek_media(target) {
+                self.error = Some(format!("Could not set playback position: {error}"));
+            }
+        }
+    }
+
+    /// Apply a temporary bend while playing, or return a seek target while paused.
+    pub(crate) fn jog(&mut self, ticks: f32, now: Instant) -> Option<Duration> {
+        if self.track.is_none() || ticks == 0.0 {
+            return None;
+        }
+        if self.playing() {
+            self.jog_bend = Some(JogBend::new(self.jog_bend.as_ref(), ticks, now));
+            None
+        } else {
+            let position = (self.position().as_secs_f64() + f64::from(ticks) * 0.015).max(0.0);
+            Some(Duration::from_secs_f64(position))
         }
     }
 
@@ -512,16 +568,36 @@ impl Deck {
     }
 
     pub fn apply_buses(&mut self, master_gain: f32, phones_gain: f32) {
+        self.apply_buses_at(master_gain, phones_gain, 0.86, Instant::now());
+    }
+
+    pub(crate) fn apply_buses_at(
+        &mut self,
+        master_gain: f32,
+        phones_gain: f32,
+        meter_decay: f32,
+        now: Instant,
+    ) {
+        if self.jog_bend.as_ref().is_some_and(|bend| {
+            !self.playing()
+                || now.saturating_duration_since(bend.started).as_secs_f32()
+                    >= JogBend::ATTACK + JogBend::RELEASE
+        }) {
+            self.jog_bend = None;
+        }
+        let speed = self.jog_bend.as_ref().map_or(self.speed, |bend| {
+            (self.speed * (1.0 + bend.offset(now))).clamp(0.5, 2.0)
+        });
         self.fx_params.set(
             self.filter,
             self.fx_level,
             self.fx_enabled,
-            self.speed,
+            speed,
             self.grid.map_or(120.0, |g| g.bpm),
         );
         self.eq_params.set(self.eq);
         self.eq_params.set_gain(self.gain);
-        self.eq_params.set_speed(self.speed);
+        self.eq_params.set_speed(speed);
         if let Some(sink) = &mut self.sink {
             if sink.master.fault.swap(false, Ordering::Relaxed)
                 || sink
@@ -532,23 +608,25 @@ impl Deck {
                 self.error = Some("Loop transport could not restore the decoder position.".into());
             }
             sink.master.set_volume(master_gain);
-            sink.set_speed(self.speed);
+            sink.set_speed(speed);
             if let Some(phones) = &sink.phones {
                 phones.set_volume(phones_gain);
             }
             let channel_peak = f32::from_bits(sink.master.peak.swap(0, Ordering::Relaxed));
-            self.channel_meter = channel_peak.max(self.channel_meter * 0.86).min(8.0);
-            self.meter = (channel_peak * master_gain).max(self.meter * 0.86).min(2.0);
+            self.channel_meter = channel_peak.max(self.channel_meter * meter_decay).min(8.0);
+            self.meter = (channel_peak * master_gain)
+                .max(self.meter * meter_decay)
+                .min(2.0);
             self.phones_meter = (sink
                 .phones
                 .as_ref()
                 .map_or(0.0, |p| f32::from_bits(p.peak.swap(0, Ordering::Relaxed)))
                 * phones_gain)
-                .max(self.phones_meter * 0.86)
+                .max(self.phones_meter * meter_decay)
                 .min(2.0);
             // Separate devices have independent clocks. Keep headphone transport near
             // the program source; never seek/correct the public master signal.
-            if sink.last_drift.elapsed() > Duration::from_secs(1) {
+            if self.jog_bend.is_none() && sink.last_drift.elapsed() > Duration::from_secs(1) {
                 sink.last_drift = Instant::now();
                 if let Some(phones) = &sink.phones
                     && !sink.master.is_paused()
@@ -584,13 +662,14 @@ impl Deck {
                 }
             }
         } else {
-            self.channel_meter *= 0.86;
-            self.meter *= 0.86;
-            self.phones_meter *= 0.86;
+            self.channel_meter *= meter_decay;
+            self.meter *= meter_decay;
+            self.phones_meter *= meter_decay;
         }
     }
 
     pub fn disconnect(&mut self) {
+        self.jog_bend = None;
         self.sink = None;
     }
 
@@ -853,6 +932,113 @@ impl<S: Source<Item = f32>> Source for Metered<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jog_bend_changes_both_outputs_and_returns_to_the_selected_tempo() {
+        let (master, _master_output) = jog_test_voice();
+        let (phones, _phones_output) = jog_test_voice();
+        let mut deck = Deck {
+            track: Some(jog_test_track()),
+            speed: 1.25,
+            sink: Some(Playback {
+                master,
+                phones: Some(phones),
+                last_drift: Instant::now(),
+            }),
+            ..Deck::default()
+        };
+        let now = Instant::now();
+        deck.apply_buses_at(0.8, 0.4, 0.86, now);
+        assert!(deck.jog(6.0, now).is_none(), "Playing jogs must never seek");
+        let mut speeds = Vec::new();
+        for ms in [8, 16, 24, 56, 104, 168, 185] {
+            deck.apply_buses_at(0.8, 0.4, 0.86, now + Duration::from_millis(ms));
+            let playback = deck.sink.as_ref().unwrap();
+            let master = playback.master.speed();
+            assert_eq!(master, playback.phones.as_ref().unwrap().speed());
+            assert!((1.25..=1.4 + f32::EPSILON).contains(&master));
+            assert_eq!(deck.speed, 1.25);
+            speeds.push(master);
+        }
+        assert!(speeds[0] > 1.25 && speeds[0] < speeds[1] && speeds[1] < speeds[2]);
+        assert!(speeds[2..].windows(2).all(|pair| pair[0] > pair[1]));
+        assert_eq!(speeds[6], 1.25);
+        assert!(deck.jog_bend.is_none());
+
+        let now = now + Duration::from_millis(200);
+        assert!(deck.jog(-3.0, now).is_none());
+        let now = now + Duration::from_millis(24);
+        deck.apply_buses_at(0.8, 0.4, 0.86, now);
+        let slowed = deck.sink.as_ref().unwrap().master.speed();
+        assert!(slowed < 1.25);
+        assert!(deck.jog(3.0, now).is_none());
+        deck.apply_buses_at(0.8, 0.4, 0.86, now);
+        assert_eq!(deck.sink.as_ref().unwrap().master.speed(), slowed);
+        deck.apply_buses_at(0.8, 0.4, 0.86, now + Duration::from_millis(24));
+        assert!(deck.sink.as_ref().unwrap().master.speed() > 1.25);
+        deck.sink.as_ref().unwrap().pause();
+        deck.apply_buses_at(0.8, 0.4, 0.86, now + Duration::from_millis(25));
+        assert_eq!(deck.sink.as_ref().unwrap().master.speed(), 1.25);
+        assert!(deck.jog_bend.is_none());
+    }
+
+    #[test]
+    fn jog_while_paused_keeps_relative_cueing_and_clamps_at_track_start() {
+        let (master, _output) = jog_test_voice();
+        master.pause();
+        master.media_samples.store(4800, Ordering::Relaxed);
+        let mut deck = Deck {
+            track: Some(jog_test_track()),
+            sink: Some(Playback {
+                master,
+                phones: None,
+                last_drift: Instant::now(),
+            }),
+            ..Deck::default()
+        };
+        let now = Instant::now();
+        assert_eq!(deck.jog(4.0, now), Some(Duration::from_millis(160)));
+        assert_eq!(deck.jog(-4.0, now), Some(Duration::from_millis(40)));
+        assert_eq!(deck.jog(-100.0, now), Some(Duration::ZERO));
+        assert!(deck.jog(0.0, now).is_none());
+        assert_eq!(deck.position(), Duration::from_millis(100));
+        assert!(deck.jog_bend.is_none());
+        assert!(Deck::default().jog(4.0, now).is_none());
+    }
+
+    fn jog_test_voice() -> (Voice, impl Source<Item = f32>) {
+        let (sink, output) = Sink::new();
+        sink.append(rodio::source::Zero::new(1, 48000));
+        let (loop_control, _) = mpsc::channel();
+        (
+            Voice {
+                sink,
+                peak: Arc::default(),
+                media_samples: Arc::default(),
+                loop_control,
+                fault: Arc::default(),
+            },
+            output,
+        )
+    }
+
+    fn jog_test_track() -> Track {
+        Track {
+            path: PathBuf::new(),
+            title: "Jog test".into(),
+            duration: Duration::from_secs(60),
+            waveform: Vec::new(),
+            sample_rate: 48000,
+            channels: 1,
+            grid: None,
+            envelope: Arc::from([]),
+            envelope_step: 0.01,
+            key: None,
+            from_cache: false,
+            cache_warning: None,
+            detailed: Arc::new(crate::waveform::Waveform::new(Vec::new(), 0.01)),
+        }
+    }
 
     #[test]
     fn regression18_visible_output_sliders_control_four_decks_and_persist_levels() {
