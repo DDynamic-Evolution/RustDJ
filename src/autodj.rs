@@ -1,65 +1,44 @@
 use crate::{
+    audio::{Audio, Deck},
+    decks::COUNT,
     dragdrop::{self, Music, Origin, Selection, Target, Zones},
-    output::{Audio, ChannelPair},
     playlist::Item,
     track,
 };
 use eframe::egui;
-use rodio::{Sink, mixer::Mixer};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
 };
 
-enum Playback {
-    Loading(usize),
-    Playing {
-        index: usize,
-        sink: Sink,
-        title: String,
-    },
-    Stopped,
-    Finished,
-}
-
-impl Playback {
-    fn index(&self) -> Option<usize> {
-        match self {
-            Self::Loading(index) | Self::Playing { index, .. } => Some(*index),
-            Self::Stopped | Self::Finished => None,
-        }
-    }
-}
-
 struct Run {
-    paths: Vec<PathBuf>,
-    playback: Playback,
-    gain: f32,
-    error: Option<String>,
+    deck: usize,
+    index: usize,
+    load_serial: u64,
+    loading: bool,
 }
 
-struct Output {
-    mixer: Mixer,
-    channels: u16,
-    pair: u16,
+pub enum Control {
+    Start(usize),
+    Next,
+    Stop,
 }
 
 #[derive(Default)]
 pub struct AutoDj {
     paths: Vec<PathBuf>,
-    run: Option<Arc<Mutex<Run>>>,
+    run: Option<Run>,
+    selected_deck: usize,
     selection: Selection,
+    finished: bool,
+    error: Option<String>,
 }
 
 impl AutoDj {
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             paths,
-            run: None,
-            selection: Selection::default(),
+            ..Self::default()
         }
     }
 
@@ -70,29 +49,24 @@ impl AutoDj {
     pub fn add(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> bool {
         let before = self.paths.len();
         self.paths.extend(paths);
-        if before == self.paths.len() {
-            return false;
+        let changed = before != self.paths.len();
+        if changed && self.run.is_none() {
+            self.reset_status();
         }
-        if let Some(run) = &self.run {
-            let mut run = run.lock().unwrap();
-            if run.playback.index().is_some() {
-                run.paths.extend_from_slice(&self.paths[before..]);
-            } else {
-                run.playback = Playback::Stopped;
-                run.error = None;
-            }
-        }
-        true
+        changed
     }
 
-    fn running(&self) -> bool {
-        self.run
-            .as_ref()
-            .is_some_and(|run| run.lock().unwrap().playback.index().is_some())
+    pub fn active_deck(&self) -> Option<usize> {
+        self.run.as_ref().map(|run| run.deck)
+    }
+
+    fn reset_status(&mut self) {
+        self.finished = false;
+        self.error = None;
     }
 
     pub fn insert(&mut self, paths: Vec<PathBuf>, before: Option<usize>) -> bool {
-        let Some(before) = before.filter(|_| !self.running()) else {
+        let Some(before) = before.filter(|_| self.run.is_none()) else {
             return self.add(paths);
         };
         if paths.is_empty() {
@@ -101,149 +75,220 @@ impl AutoDj {
         let before = before.min(self.paths.len());
         self.selection.select_range(before..before + paths.len());
         self.paths.splice(before..before, paths);
-        self.run = None;
+        self.reset_status();
         true
     }
 
     pub fn move_to(&mut self, range: Range<usize>, before: Option<usize>) -> bool {
-        if self.running() {
+        if self.run.is_some() {
             return false;
         }
         let Some(moved) = dragdrop::move_range(&mut self.paths, range, before) else {
             return false;
         };
         self.selection.select_range(moved);
-        self.run = None;
+        self.reset_status();
         true
     }
 
-    pub fn current_title(&self) -> Option<String> {
-        let run = self.run.as_ref()?.lock().unwrap();
-        match &run.playback {
-            Playback::Playing { sink, title, .. } if !sink.empty() => Some(title.clone()),
-            _ => None,
+    pub fn start(&mut self, deck: usize, target: &mut Deck, ctx: &egui::Context) -> bool {
+        if self.run.is_some() || self.paths.is_empty() || target.playing() || target.loading() {
+            return false;
+        }
+        self.reset_status();
+        self.load(deck, 0, target, ctx);
+        true
+    }
+
+    fn load(&mut self, deck: usize, index: usize, target: &mut Deck, ctx: &egui::Context) {
+        let Some(path) = self.paths.get(index) else {
+            self.run = None;
+            self.finished = true;
+            return;
+        };
+        target.load(path.clone(), ctx.clone());
+        self.run = Some(Run {
+            deck,
+            index,
+            load_serial: target.load_serial(),
+            loading: true,
+        });
+    }
+
+    fn release_deck(run: &Run, target: &mut Deck, audio: &Audio) {
+        if run.load_serial == target.load_serial() {
+            if run.loading {
+                target.cancel_load();
+            } else {
+                target.stop(audio);
+            }
         }
     }
 
-    pub fn stop(&mut self) -> bool {
+    pub fn stop(&mut self, decks: &mut [Deck; COUNT], audio: &Audio) -> bool {
         let Some(run) = self.run.take() else {
             return false;
         };
-        let mut run = run.lock().unwrap();
-        let running = run.playback.index().is_some();
-        run.playback = Playback::Stopped;
-        running
+        Self::release_deck(&run, &mut decks[run.deck], audio);
+        self.reset_status();
+        true
     }
 
-    fn next(&mut self) {
-        if let Some(run) = &self.run {
-            let mut run = run.lock().unwrap();
-            if let Some(index) = run.playback.index() {
-                run.playback = Playback::Loading(index + 1);
+    pub fn next(&mut self, decks: &mut [Deck; COUNT], audio: &Audio, ctx: &egui::Context) {
+        if let Some(run) = self.run.take() {
+            let target = &mut decks[run.deck];
+            if run.load_serial == target.load_serial() {
+                Self::release_deck(&run, target, audio);
+                self.load(run.deck, run.index + 1, target, ctx);
             }
         }
     }
 
-    fn start(&mut self, output: Output, gain: f32, ctx: &egui::Context) {
-        self.stop();
-        let run = Arc::new(Mutex::new(Run {
-            paths: self.paths.clone(),
-            playback: Playback::Loading(0),
-            gain,
-            error: None,
-        }));
-        let worker = Arc::clone(&run);
-        let ctx = ctx.clone();
-        thread::spawn(move || play_queue(worker, output, ctx));
-        self.run = Some(run);
-    }
-
-    pub fn set_gain(&mut self, gain: f32) {
-        if let Some(run) = &self.run {
-            let mut run = run.lock().unwrap();
-            run.gain = gain;
-            if let Playback::Playing { sink, .. } = &run.playback {
-                sink.set_volume(gain);
-            }
+    pub fn on_loaded(&mut self, index: usize, deck: &mut Deck, audio: &Audio) {
+        if let Some(run) = &mut self.run
+            && run.loading
+            && run.deck == index
+            && run.load_serial == deck.load_serial()
+            && deck.play(audio)
+        {
+            run.loading = false;
         }
     }
 
-    fn status(&self) -> (Option<usize>, String, Option<String>) {
+    pub fn update(&mut self, decks: &mut [Deck; COUNT], ctx: &egui::Context) {
         let Some(run) = &self.run else {
-            return (None, format!("{} tracks", self.paths.len()), None);
+            return;
         };
-        let run = run.lock().unwrap();
-        let status = match &run.playback {
-            Playback::Finished => String::from("Playlist finished"),
-            Playback::Stopped => format!("{} tracks", self.paths.len()),
-            Playback::Loading(index) => run.paths.get(*index).map_or_else(
-                || String::from("Finishing playlist …"),
-                |path| {
-                    format!(
-                        "Loading {}/{} · {}",
-                        index + 1,
-                        run.paths.len(),
-                        file_title(path)
-                    )
-                },
-            ),
-            Playback::Playing { index, title, .. } => {
-                format!("Playing {}/{} · {title}", index + 1, run.paths.len())
-            }
-        };
-        (run.playback.index(), status, run.error.clone())
+        let deck = &mut decks[run.deck];
+        if deck.load_serial() != run.load_serial {
+            self.error = Some(format!(
+                "AutoDJ stopped after a manual load on Deck {}.",
+                run.deck + 1
+            ));
+            self.run = None;
+            return;
+        }
+        if run.loading && !deck.loading() {
+            let title = file_title(&self.paths[run.index]);
+            let detail = deck.error.as_deref().unwrap_or("Could not start playback.");
+            self.error = Some(format!("Skipped {title}. {detail}"));
+            self.load(run.deck, run.index + 1, deck, ctx);
+        } else if !run.loading && deck.reached_end() {
+            self.load(run.deck, run.index + 1, deck, ctx);
+        }
     }
 
-    pub fn ui(
+    pub fn controls(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        audio: &Audio,
-        gain: f32,
-        browser_selection: Vec<PathBuf>,
-        playlist: &[Item],
-        drops: &mut Zones,
-    ) -> bool {
-        let (current, status, error) = self.status();
-        let idle = current.is_none();
-        let master = audio.stream.as_ref().zip(audio.bus(false));
-        let mut changed = false;
-        ui.horizontal(|ui| {
+        deck_order: &[usize],
+        decks: &[Deck; COUNT],
+        audio_ready: bool,
+        master_gains: &[f32; COUNT],
+    ) -> Option<Control> {
+        let mut action = None;
+        let idle = self.run.is_none();
+        if !deck_order.contains(&self.selected_deck) {
+            self.selected_deck = deck_order[0];
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                egui::ComboBox::from_id_salt("autodj-deck")
+                    .width(62.0)
+                    .selected_text(format!("Deck {}", self.selected_deck + 1))
+                    .show_ui(ui, |ui| {
+                        for &deck in deck_order {
+                            ui.selectable_value(
+                                &mut self.selected_deck,
+                                deck,
+                                format!("Deck {}", deck + 1),
+                            );
+                        }
+                    });
+            });
+            let deck = &decks[self.selected_deck];
+            let busy = deck.playing() || deck.loading();
+            let disabled_hint = if !audio_ready {
+                "Connect a master output to start AutoDJ."
+            } else if busy && idle {
+                "Stop this deck or choose another deck to start AutoDJ."
+            } else {
+                "Add tracks to the AutoDJ playlist."
+            };
             if ui
                 .add_enabled(
-                    idle && master.is_some() && !self.paths.is_empty(),
+                    idle && audio_ready && !busy && !self.paths.is_empty(),
                     egui::Button::new("Start AutoDJ"),
                 )
-                .on_disabled_hover_text("Add tracks and connect a master output to start AutoDJ.")
+                .on_disabled_hover_text(disabled_hint)
                 .clicked()
-                && let Some((output, mixer)) = master
             {
-                self.start(
-                    Output {
-                        mixer: mixer.clone(),
-                        channels: output.config().channel_count(),
-                        pair: audio.routing.master.pair,
-                    },
-                    gain,
-                    ctx,
-                );
+                action = Some(Control::Start(self.selected_deck));
             }
             if ui.add_enabled(!idle, egui::Button::new("Stop")).clicked() {
-                self.stop();
+                action = Some(Control::Stop);
             }
             if ui.add_enabled(!idle, egui::Button::new("Next")).clicked() {
-                self.next();
+                action = Some(Control::Next);
             }
         });
+        let status = if let Some(run) = &self.run {
+            let deck = &decks[run.deck];
+            let phase = if run.loading {
+                "Loading"
+            } else if deck.playing() {
+                "Playing"
+            } else {
+                "Paused"
+            };
+            let title = if run.loading {
+                file_title(&self.paths[run.index])
+            } else {
+                deck.track.as_ref().map_or_else(
+                    || file_title(&self.paths[run.index]),
+                    |track| track.title.clone(),
+                )
+            };
+            format!(
+                "{phase} {}/{} · Deck {} · {title}",
+                run.index + 1,
+                self.paths.len(),
+                run.deck + 1
+            )
+        } else if self.finished {
+            String::from("Playlist finished")
+        } else {
+            format!("{} tracks", self.paths.len())
+        };
         ui.add(egui::Label::new(&status).truncate())
             .on_hover_text(status);
-        if let Some(error) = &error {
+        if self
+            .active_deck()
+            .is_some_and(|deck| master_gains[deck] <= 0.0001)
+        {
+            ui.colored_label(egui::Color32::LIGHT_RED, "Deck muted in the master mix.")
+                .on_hover_text("Check the deck fader, crossfader and master volume.");
+        }
+        if let Some(error) = &self.error {
             ui.add(
                 egui::Label::new(egui::RichText::new(error).color(egui::Color32::LIGHT_RED))
                     .truncate(),
             )
             .on_hover_text(error);
         }
+        action
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        browser_selection: Vec<PathBuf>,
+        playlist: &[Item],
+        drops: &mut Zones,
+    ) -> bool {
+        let current = self.run.as_ref().map(|run| run.index);
+        let idle = current.is_none();
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
@@ -301,7 +346,7 @@ impl AutoDj {
             {
                 self.paths.drain(range);
                 self.selection = Selection::default();
-                self.run = None;
+                self.reset_status();
                 changed = true;
             }
         });
@@ -348,69 +393,6 @@ impl AutoDj {
             }
         });
         changed
-    }
-}
-
-impl Drop for AutoDj {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn play_queue(run: Arc<Mutex<Run>>, output: Output, ctx: egui::Context) {
-    loop {
-        let (index, path) = {
-            let mut state = run.lock().unwrap();
-            let index = match &state.playback {
-                Playback::Stopped | Playback::Finished => return,
-                Playback::Loading(index) => *index,
-                Playback::Playing { index, sink, .. } if sink.empty() => index + 1,
-                Playback::Playing { .. } => {
-                    drop(state);
-                    thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-            };
-            let Some(path) = state.paths.get(index).cloned() else {
-                state.playback = Playback::Finished;
-                drop(state);
-                ctx.request_repaint();
-                return;
-            };
-            state.playback = Playback::Loading(index);
-            (index, path)
-        };
-        ctx.request_repaint();
-
-        let loaded = track::open_decoder(&path).map(|decoder| {
-            let tags = track::read_tags(&path);
-            let title = match (tags.artist.is_empty(), tags.title.is_empty()) {
-                (_, true) => file_title(&path),
-                (true, false) => tags.title,
-                (false, false) => format!("{} · {}", tags.artist, tags.title),
-            };
-            (decoder, title)
-        });
-
-        let mut state = run.lock().unwrap();
-        // Stop and Next can change the playback state while a file is opening.
-        if !matches!(state.playback, Playback::Loading(pending) if pending == index) {
-            continue;
-        }
-        match loaded {
-            Ok((decoder, title)) => {
-                let sink = Sink::connect_new(&output.mixer);
-                sink.set_volume(state.gain);
-                sink.append(ChannelPair::new(decoder, output.channels, output.pair));
-                state.playback = Playback::Playing { index, sink, title };
-            }
-            Err(error) => {
-                state.error = Some(format!("Skipped {}. {error}", file_title(&path)));
-                state.playback = Playback::Loading(index + 1);
-            }
-        }
-        drop(state);
-        ctx.request_repaint();
     }
 }
 

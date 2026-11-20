@@ -1,6 +1,6 @@
 use crate::{
     audio::{Audio, Deck},
-    autodj::AutoDj,
+    autodj::{AutoDj, Control as AutoDjControl},
     beat::{BeatGrid, sync_plan},
     broadcast_mix::{Talkover, TalkoverSettings},
     browser::{Browser, Event as BrowserEvent},
@@ -390,7 +390,7 @@ impl RustDj {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             for &index in self.deck_layout.order() {
-                self.decks[index].stop(&self.audio);
+                self.stop_deck(index);
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
@@ -404,6 +404,9 @@ impl RustDj {
     fn set_deck_layout(&mut self, layout: DeckLayout) {
         if self.deck_layout == layout {
             return;
+        }
+        if self.autodj.active_deck().is_some_and(|deck| !layout.contains(deck)) {
+            self.autodj.stop(&mut self.decks, &self.audio);
         }
         self.deck_layout = layout;
         if !layout.contains(self.active) {
@@ -740,6 +743,14 @@ impl RustDj {
         }
     }
 
+    fn stop_deck(&mut self, deck: usize) {
+        if self.autodj.active_deck() == Some(deck) {
+            self.autodj.stop(&mut self.decks, &self.audio);
+        } else {
+            self.decks[deck].stop(&self.audio);
+        }
+    }
+
     fn tap_bpm(&mut self, deck: usize) {
         let now = Instant::now();
         let taps = &mut self.taps[deck];
@@ -829,7 +840,7 @@ impl RustDj {
                 Action::Play(d) => self.toggle_deck(d),
                 Action::Cue(d) => self.decks[d].cue_button(value > 0.0, &self.audio),
                 Action::SetCue(d) => self.decks[d].cue = self.decks[d].position(),
-                Action::Stop(d) => self.decks[d].stop(&self.audio),
+                Action::Stop(d) => self.stop_deck(d),
                 Action::Sync(d) => self.sync(d),
                 Action::Volume(d) => self.decks[d].volume = value.clamp(0.0, 1.0),
                 Action::Tempo(d) => {
@@ -1925,7 +1936,7 @@ impl RustDj {
                 audio.master_eq.set(self.master_eq);
                 audio.limiter.set(self.master_limiter);
                 self.jingles.stop_all();
-                let autodj_was_running = self.autodj.stop();
+                let autodj_was_running = self.autodj.stop(&mut self.decks, &self.audio);
                 let mut errors = Vec::new();
                 for deck in &mut self.decks {
                     if let Err(error) = deck.rebind(&audio) {
@@ -2140,8 +2151,10 @@ impl eframe::App for RustDj {
         self.poll_keyring();
         self.browser.poll();
         self.midi.tick(ctx);
+        let mut loaded_this_frame = [None; COUNT];
         for (index, deck) in self.decks.iter_mut().enumerate() {
             if let Some(track) = deck.poll(&self.audio) {
+                loaded_this_frame[index] = Some(deck.load_serial());
                 self.browser.on_track(&track);
                 self.playlist.on_track(&track);
                 self.synced[index] = None;
@@ -2239,6 +2252,9 @@ impl eframe::App for RustDj {
             if response.open {
                 self.pick(index, ctx);
             }
+            if response.stopped {
+                self.stop_deck(index);
+            }
             if response.edit_grid {
                 self.open_grid_editor(index);
             }
@@ -2295,15 +2311,35 @@ impl eframe::App for RustDj {
                         }
                     }
                     LibraryTab::AutoDj => {
+                        let gains = self.mix_gains();
+                        let control = self.autodj.controls(
+                            ui,
+                            deck_order,
+                            &self.decks,
+                            self.audio.stream.is_some() && self.audio.bus(false).is_some(),
+                            &gains.master,
+                        );
                         self.audio_dirty |= self.autodj.ui(
                             ui,
-                            ctx,
-                            &self.audio,
-                            self.master * self.talkover.gain(),
                             self.browser.selected_paths(),
                             &self.playlist.items,
                             &mut drops,
                         );
+                        match control {
+                            Some(AutoDjControl::Start(deck)) => {
+                                if self.autodj.start(deck, &mut self.decks[deck], ctx) {
+                                    self.active = deck;
+                                    self.library_view = false;
+                                }
+                            }
+                            Some(AutoDjControl::Next) => {
+                                self.autodj.next(&mut self.decks, &self.audio, ctx);
+                            }
+                            Some(AutoDjControl::Stop) => {
+                                self.autodj.stop(&mut self.decks, &self.audio);
+                            }
+                            None => {}
+                        }
                     }
                 }
             });
@@ -2339,7 +2375,6 @@ impl eframe::App for RustDj {
         self.history_ui(ctx);
         self.grid_editor_ui(ctx);
         self.jingles.update(self.master);
-        self.autodj.set_gain(self.master * self.talkover.gain());
         self.playlist.confirm_changes(ctx);
         if let Some((target, music)) = drops.finish(ctx) {
             match target {
@@ -2427,19 +2462,21 @@ impl eframe::App for RustDj {
         let now = Instant::now();
         for (index, deck) in self.decks.iter_mut().enumerate() {
             deck.apply_buses_at(gains.master[index], gains.phones[index], meter_decay, now);
+            if loaded_this_frame[index] == Some(deck.load_serial()) {
+                self.autodj.on_loaded(index, deck, &self.audio);
+            }
             if let Some(snapshot) = deck.take_hotcue_changes() {
                 self.hotcue_store.save(snapshot);
             }
         }
+        self.autodj.update(&mut self.decks, ctx);
         self.log_audible_tracks(&gains, now);
         let dominant = (0..COUNT)
             .filter(|i| self.decks[*i].playing() && gains.master[*i] > 0.0001)
             .max_by(|a, b| gains.master[*a].total_cmp(&gains.master[*b]));
-        let autodj_title = self.autodj.current_title();
         let title = if self.stream_settings.automatic_title {
             dominant
                 .and_then(|i| self.decks[i].track.as_ref().map(|t| t.title.as_str()))
-                .or(autodj_title.as_deref())
                 .unwrap_or(&self.stream_settings.station)
         } else {
             &self.stream_settings.manual_title
@@ -2629,6 +2666,7 @@ struct DeckResponse {
     sync: bool,
     tap: bool,
     toggled: bool,
+    stopped: bool,
     tempo_changed: bool,
 }
 
@@ -2801,7 +2839,7 @@ fn deck_ui(
                     .add_enabled(available, egui::Button::new("STOP"))
                     .clicked()
                 {
-                    deck.stop(audio);
+                    response.stopped = true;
                 }
             });
             response.performance_changed |=

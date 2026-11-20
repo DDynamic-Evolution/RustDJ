@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.24.3
+# RustDJ 0.24.4
 
 RustDJ is a desktop DJ and broadcasting app for Windows and Linux. Mix with
 two or four decks, browse your music, and send the master mix to SHOUTcast
@@ -31,7 +31,7 @@ repository root, install the amd64 package and launch RustDJ from the
 application menu or run `rustdj`.
 
 ```bash
-sudo apt install ./outputs/rustdj_0.24.3_amd64.deb
+sudo apt install ./outputs/rustdj_0.24.4_amd64.deb
 ```
 
 The Linux build was tested on Linux Mint 22.3, which uses an Ubuntu 24.04
@@ -182,11 +182,14 @@ Relative paths, spaces and Unicode names are supported.
 The **AutoDJ** tab has its own saved playlist. Right-click a track in the
 browser and choose **Add to AutoDJ**, drag tracks onto the tab, or use
 **Add selection**, **Files …** and **Add playlist** to build the list.
-Select an entry to reorder or remove it while AutoDJ is stopped. **Start AutoDJ**
-loads and plays the first entry through the master mix. It then loads each
-successive entry and displays the current title and its position in the list.
-**Next** skips the current track and **Stop** ends playback and cancels a
-pending track. AutoDJ skips unavailable files and stops after the last track.
+Select an entry to reorder or remove it while AutoDJ is stopped. Choose a deck
+in the AutoDJ tab and press **Start AutoDJ**. RustDJ shows that deck, loads the
+first track and starts it automatically. At the end of a track, AutoDJ loads
+and plays the next entry on the same deck. The deck fader, crossfader and master
+volume control the sound. **Next** skips a track. **Stop** in AutoDJ or on the
+deck ends the run and cancels a pending track. AutoDJ skips unavailable files
+and stops after the last track. Manually loading the AutoDJ deck takes it back
+for manual playback.
 
 **SESSION / SIDELIST** contains tracks successfully loaded during this session,
 with each path listed once. Search filters the session list. The sidelist width

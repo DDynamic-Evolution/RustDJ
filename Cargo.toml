@@ -1,6 +1,6 @@
 [package]
 name = "rustdj"
-version = "0.24.3"
+version = "0.24.4"
 edition = "2024"
 description = "A Rust-based DJ application"
 rust-version = "1.88"

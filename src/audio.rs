@@ -82,6 +82,7 @@ pub struct Deck {
     cue_latch: CueLatch,
     sink: Option<Playback>,
     job: Option<LoadJob>,
+    load_serial: u64,
 }
 
 struct JogBend {
@@ -279,12 +280,14 @@ impl Default for Deck {
             cue_latch: CueLatch::default(),
             sink: None,
             job: None,
+            load_serial: 0,
         }
     }
 }
 
 impl Deck {
     pub fn load(&mut self, path: PathBuf, ctx: eframe::egui::Context) {
+        self.load_serial = self.load_serial.wrapping_add(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancelled.clone();
         let (sender, receiver) = mpsc::channel();
@@ -340,6 +343,18 @@ impl Deck {
 
     pub fn loading(&self) -> bool {
         self.job.is_some()
+    }
+
+    pub(crate) fn load_serial(&self) -> u64 {
+        self.load_serial
+    }
+
+    pub(crate) fn cancel_load(&mut self) {
+        self.job = None;
+    }
+
+    pub(crate) fn reached_end(&self) -> bool {
+        self.sink.as_ref().is_some_and(|sink| sink.empty()) && !self.loop_pending()
     }
 
     /// Returns the successfully loaded track for the session library.
@@ -506,11 +521,15 @@ impl Deck {
             }
             return;
         }
-        if !self.ensure_source(audio) {
-            return;
-        }
-        if let Some(sink) = &self.sink {
+        self.play(audio);
+    }
+
+    pub(crate) fn play(&mut self, audio: &Audio) -> bool {
+        if self.ensure_source(audio) && let Some(sink) = &self.sink {
             sink.play();
+            true
+        } else {
+            false
         }
     }
 

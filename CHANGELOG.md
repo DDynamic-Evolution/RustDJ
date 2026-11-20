@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.4
+
+- AutoDJ loads and plays its queue on a selectable deck with the normal waveform, transport and mixer controls.
+
 ## 0.24.3
 
 - Added Shift-click range selection and group drag-and-drop to the music browser, collection, regular playlist and AutoDJ playlist.
