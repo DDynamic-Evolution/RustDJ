@@ -29,6 +29,7 @@ struct Loaded {
     track: Track,
     cues: Hotcues,
     identity: Fingerprint,
+    corrected_grid: Option<BeatGrid>,
 }
 
 struct LoopJob {
@@ -291,19 +292,40 @@ impl Deck {
             let result = (|| {
                 let mut track = crate::analysis::load(path, &cancel_worker)?;
                 let identity = Fingerprint::read(&track.path)?;
-                let cues = match Database::open(&database::default_path())
-                    .and_then(|db| db.hotcues(&track.path, &identity))
-                {
-                    Ok(cues) => cues.map(|cue| cue.filter(|p| *p < track.duration)),
+                let (cues, corrected_grid) = match Database::open(&database::default_path()) {
+                    Ok(db) => {
+                        let cues = match db.hotcues(&track.path, &identity) {
+                            Ok(cues) => cues.map(|cue| cue.filter(|p| *p < track.duration)),
+                            Err(error) => {
+                                track.cache_warning =
+                                    Some(format!("Hotcues were not loaded: {error}"));
+                                [None; 8]
+                            }
+                        };
+                        let corrected = match db.grid_correction(&track.path, &identity) {
+                            Ok(grid) => grid.filter(|grid| {
+                                (40.0..=250.0).contains(&grid.bpm)
+                                    && (0.0..track.duration.as_secs_f64()).contains(&grid.offset)
+                            }),
+                            Err(error) => {
+                                track.cache_warning =
+                                    Some(format!("Beatgrid correction was not loaded: {error}"));
+                                None
+                            }
+                        };
+                        (cues, corrected)
+                    }
                     Err(error) => {
-                        track.cache_warning = Some(format!("Hotcues were not loaded: {error}"));
-                        [None; 8]
+                        track.cache_warning =
+                            Some(format!("Track settings were not loaded: {error}"));
+                        ([None; 8], None)
                     }
                 };
                 Ok(Loaded {
                     track,
                     cues,
                     identity,
+                    corrected_grid,
                 })
             })();
             let _ = sender.send(result);
@@ -339,6 +361,7 @@ impl Deck {
                 track,
                 cues,
                 identity,
+                corrected_grid,
             }) => match self.make_sink(&track, audio) {
                 Ok(sink) => {
                     self.exit_loop();
@@ -356,7 +379,7 @@ impl Deck {
                     self.meter = 0.0;
                     self.channel_meter = 0.0;
                     self.phones_meter = 0.0;
-                    self.grid = track.grid;
+                    self.grid = corrected_grid.or(track.grid);
                     self.error = track.cache_warning.clone();
                     self.track = Some(track.clone());
                     return Some(track);
@@ -420,6 +443,25 @@ impl Deck {
         self.sink
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty())
+    }
+
+    pub fn program_playing(&self) -> bool {
+        self.playing() && !self.cue_latch.previewing
+    }
+
+    pub fn save_grid(&self, grid: Option<BeatGrid>) -> Result<(), String> {
+        let track = self.track.as_ref().ok_or("Load a track first.")?;
+        if grid.is_some_and(|grid| !(0.0..track.duration.as_secs_f64()).contains(&grid.offset)) {
+            return Err("The first beat must be within the track.".into());
+        }
+        let identity = self
+            .hotcue_identity
+            .as_ref()
+            .ok_or("Track identity is unavailable.")?;
+        if &Fingerprint::read(&track.path)? != identity {
+            return Err("The music file changed. Reload the deck before saving a grid.".into());
+        }
+        Database::open(&database::default_path())?.save_grid_correction(&track.path, identity, grid)
     }
 
     pub fn position(&self) -> Duration {

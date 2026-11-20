@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RustDJ
+Comment=Mix, record and stream music
+Comment[de]=Musik mischen, aufnehmen und streamen
+Exec=rustdj
+Icon=rustdj
+StartupWMClass=rustdj
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=DJ;Mixer;MIDI;SHOUTcast;

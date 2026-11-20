@@ -1,4 +1,4 @@
-//! Ordered, background persistence of user hotcues, independently of analysis results.
+//! Ordered background persistence of hotcues and play history.
 use crate::database::{self, Database, Fingerprint};
 use std::{
     path::PathBuf,
@@ -14,8 +14,18 @@ pub struct Snapshot {
     pub cues: Hotcues,
 }
 
+enum Event {
+    Hotcues(Snapshot),
+    Play {
+        title: String,
+        path: PathBuf,
+        deck: usize,
+        timestamp: i64,
+    },
+}
+
 pub struct Store {
-    sender: Option<Sender<Snapshot>>,
+    sender: Option<Sender<Event>>,
     errors: Receiver<String>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -26,23 +36,32 @@ impl Default for Store {
 }
 impl Store {
     pub fn at(path: PathBuf) -> Self {
-        let (sender, receiver) = mpsc::channel::<Snapshot>();
+        let (sender, receiver) = mpsc::channel::<Event>();
         let (errors, reports) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut db = None;
-            for snapshot in receiver {
+            for event in receiver {
                 let result = (|| {
-                    if Fingerprint::read(&snapshot.path)? != snapshot.identity {
-                        return Err("Hotcues were not saved: the music file changed.".into());
-                    }
                     if db.is_none() {
                         db = Some(Database::open(&path)?);
                     }
-                    db.as_ref().unwrap().save_hotcues(
-                        &snapshot.path,
-                        &snapshot.identity,
-                        snapshot.cues,
-                    )
+                    let db = db.as_ref().unwrap();
+                    match event {
+                        Event::Hotcues(snapshot) => {
+                            if Fingerprint::read(&snapshot.path)? != snapshot.identity {
+                                return Err(
+                                    "Hotcues were not saved: the music file changed.".into()
+                                );
+                            }
+                            db.save_hotcues(&snapshot.path, &snapshot.identity, snapshot.cues)
+                        }
+                        Event::Play {
+                            title,
+                            path,
+                            deck,
+                            timestamp,
+                        } => db.log_play(&title, &path, deck, timestamp),
+                    }
                 })();
                 if let Err(error) = result {
                     let _ = errors.send(error);
@@ -59,9 +78,20 @@ impl Store {
 impl Store {
     pub fn save(&self, snapshot: Snapshot) {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(snapshot);
+            let _ = sender.send(Event::Hotcues(snapshot));
         }
     }
+    pub fn play(&self, title: String, path: PathBuf, deck: usize, timestamp: i64) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Event::Play {
+                title,
+                path,
+                deck,
+                timestamp,
+            });
+        }
+    }
+
     pub fn error(&self) -> Option<String> {
         self.errors.try_iter().last()
     }

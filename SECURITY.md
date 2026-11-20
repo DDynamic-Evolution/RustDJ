@@ -25,6 +25,8 @@ in server/proxy logging. RustDJ does not include passwords or requests in its
 connection-error messages.
 
 Windows DPAPI protects the saved password for the current Windows account.
+On Linux, RustDJ stores the password through the desktop Secret Service
+when you click **Save password**. Each stream profile has its own keyring entry.
 Local storage encryption and transport encryption protect different boundaries.
 Streaming and recording never start automatically.
 

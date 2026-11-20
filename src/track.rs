@@ -53,16 +53,33 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     let bucket_samples = (sample_rate as usize / 100).max(1) * channels as usize;
     let mut peaks = Vec::new();
     let mut peak = 0.0_f32;
-    let mut energy_sum = 0.0_f64;
-    let mut energies = Vec::new();
+    let mut rhythm = [Vec::new(), Vec::new(), Vec::new()];
+    let mut rhythm_energy = [0.0_f64; 3];
+    let mut rhythm_frames = 0;
+    let rhythm_step = 10.0 * (sample_rate / 1000).max(1) as f64 / sample_rate as f64;
+    let rhythm_limit = (1200.0 / rhythm_step) as usize;
+    let rhythm_samples = 10 * (sample_rate / 1000).max(1) as usize * channels as usize;
     let mut count = 0_u64;
     for sample in decoder {
-        detailed.push(sample);
+        if let Some(energy) = detailed.push_with_energy(sample)
+            && rhythm[0].len() < rhythm_limit
+        {
+            for (total, value) in rhythm_energy.iter_mut().zip(energy) {
+                *total += value;
+            }
+            rhythm_frames += 1;
+            if rhythm_frames == 10 {
+                for (band, total) in rhythm.iter_mut().zip(rhythm_energy) {
+                    band.push((total / rhythm_samples as f64).sqrt() as f32);
+                }
+                rhythm_frames = 0;
+                rhythm_energy = [0.0; 3];
+            }
+        }
         if count.is_multiple_of(4096) && cancelled.load(Ordering::Relaxed) {
             return Err("Loading cancelled.".into());
         }
         peak = peak.max(sample.abs().min(1.0));
-        energy_sum += (sample as f64).powi(2);
         count += 1;
         mono += sample as f64;
         if count.is_multiple_of(channels as u64) {
@@ -71,10 +88,6 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
         }
         if count.is_multiple_of(bucket_samples as u64) {
             peaks.push(peak);
-            if energies.len() < 12100 {
-                energies.push((energy_sum / bucket_samples as f64).sqrt() as f32);
-            }
-            energy_sum = 0.0;
             peak = 0.0;
         }
     }
@@ -91,7 +104,7 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
         .to_string_lossy()
         .into_owned();
     let step = bucket_samples as f64 / channels as f64 / sample_rate as f64;
-    let grid = beat::detect(&energies, step);
+    let grid = beat::detect_bands(&rhythm, rhythm_step);
     if cancelled.load(Ordering::Relaxed) {
         return Err("Loading cancelled.".into());
     }

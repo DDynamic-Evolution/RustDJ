@@ -1,5 +1,6 @@
 use crate::{
     browser::BrowserSettings,
+    decks::Layout,
     midi::{Binding, MidiPrefs},
     output::Routing,
 };
@@ -10,12 +11,21 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct Settings {
     pub browser: BrowserSettings,
+    pub deck_layout: Layout,
     pub bindings: Option<Vec<Binding>>,
     pub routing: Routing,
     pub mix: MixSettings,
     pub mapping_version: u32,
     pub midi: MidiPrefs,
     pub streamer: crate::streamer::StreamSettings,
+    pub stream_profiles: Vec<crate::streamer::StreamProfile>,
+    pub active_stream_profile: u64,
+    pub stream_profile_serial: u64,
+    pub inputs: [crate::inputs::InputSettings; 2],
+    pub microphone: crate::inputs::InputSettings,
+    pub talkover: crate::broadcast_mix::TalkoverSettings,
+    pub master_limiter: bool,
+    pub jingles: crate::jingles::Settings,
     pub master_eq: crate::equalizer::Settings,
 }
 
@@ -39,11 +49,37 @@ impl Default for MixSettings {
 }
 
 fn path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    return linux_data_path("XDG_CONFIG_HOME", ".config", "settings.json");
+
+    #[cfg(not(target_os = "linux"))]
+    return config_dir().join("settings.json");
+}
+
+pub(crate) fn config_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("RustDJ").join("settings.json")
+    base.join("RustDJ")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_data_path(variable: &str, default_dir: &str, file: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.as_ref().map(|path| path.join(default_dir)))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("RustDJ")
+        .join(file);
+
+    let legacy = config_dir().join(file);
+    if !path.exists() && legacy.is_file() {
+        return legacy;
+    }
+    path
 }
 
 pub fn load() -> (Settings, Option<String>) {

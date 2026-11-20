@@ -429,6 +429,7 @@ impl Playlist {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         active: usize,
+        deck_order: &[usize],
         drops: &mut Zones,
     ) -> Option<(usize, PathBuf)> {
         self.poll();
@@ -534,7 +535,7 @@ impl Playlist {
                 for (index, item) in self.items.iter().enumerate() {
                     let row = ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            for deck in crate::decks::ORDER {
+                            for &deck in deck_order {
                                 let label = (deck + 1).to_string();
                                 if ui
                                     .add_enabled(

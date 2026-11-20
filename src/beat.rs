@@ -1,5 +1,4 @@
-//! Lightweight constant-tempo analysis on a 100 Hz RMS envelope.
-//! Not a downbeat detector: grids can be corrected by the user.
+//! Constant-tempo beat grids from frequency-band transients and periodicity.
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -19,16 +18,67 @@ impl BeatGrid {
 }
 
 pub fn detect(energy: &[f32], step: f64) -> Option<BeatGrid> {
-    if energy.len() < 400 || !step.is_finite() || step <= 0.0 {
+    if !step.is_finite() || step <= 0.0 {
         return None;
     }
-    // Bounded work, even for multi-hour recordings.
-    let energy = &energy[..energy.len().min((120.0 / step) as usize)];
-    let mut onsets = vec![0.0_f32; energy.len()];
-    for i in 1..energy.len() {
-        let start = i.saturating_sub(4);
-        let baseline = energy[start..i].iter().sum::<f32>() / (i - start) as f32;
-        onsets[i] = (energy[i] - baseline).max(0.0);
+    let energy = &energy[..energy.len().min((1200.0 / step) as usize)];
+    detect_onsets(&onset_strength(energy), step)
+}
+
+pub(crate) fn detect_bands(energy: &[Vec<f32>; 3], step: f64) -> Option<BeatGrid> {
+    let mut onsets = vec![0.0; energy[0].len()];
+    let maxima = energy
+        .each_ref()
+        .map(|band| band.iter().copied().fold(0.0_f32, f32::max));
+    let loudest = maxima.into_iter().fold(0.0_f32, f32::max);
+    for ((band, maximum), weight) in energy.iter().zip(maxima).zip([0.58, 0.30, 0.12]) {
+        if maximum < 0.0001 {
+            continue;
+        }
+        // A quiet band can support the beat without dominating the phase.
+        let weight = weight * (3.0 * (maximum / loudest).sqrt()).min(1.0);
+        for (total, onset) in onsets.iter_mut().zip(onset_strength(band)) {
+            *total += onset * weight;
+        }
+    }
+    detect_onsets(&onsets, step)
+}
+
+fn onset_strength(energy: &[f32]) -> Vec<f32> {
+    let mut onsets = vec![0.0; energy.len()];
+    let maximum = energy.iter().copied().fold(0.0_f32, f32::max);
+    if maximum < 0.0001 {
+        return onsets;
+    }
+    let mut previous = (energy[0] * 5.0 / maximum).ln_1p();
+    let mut tail = 0.0_f32;
+    for (onset, &rms) in onsets[1..].iter_mut().zip(&energy[1..]) {
+        let value = (rms * 5.0 / maximum).ln_1p();
+        let rise = (value - previous).max(0.0);
+        *onset = (rise - tail * 0.5).max(0.0);
+        tail = (tail * 0.55).max(rise);
+        previous = previous * 0.5 + value * 0.5;
+    }
+    // Normalize each band by a strong typical transient instead of a single spike.
+    let peak = onsets.iter().copied().fold(0.0_f32, f32::max);
+    let mut accents: Vec<_> = onsets
+        .iter()
+        .copied()
+        .filter(|v| *v > peak * 0.10)
+        .collect();
+    if !accents.is_empty() {
+        let rank = (accents.len() - 1) * 9 / 10;
+        let scale = *accents.select_nth_unstable_by(rank, f32::total_cmp).1;
+        for onset in &mut onsets {
+            *onset = (*onset / scale).min(1.5);
+        }
+    }
+    onsets
+}
+
+fn detect_onsets(onsets: &[f32], step: f64) -> Option<BeatGrid> {
+    if !step.is_finite() || step <= 0.0 || onsets.len() as f64 * step < 3.8 {
+        return None;
     }
     let maximum = onsets.iter().copied().fold(0.0_f32, f32::max);
     if maximum < 0.0001 || onsets.iter().filter(|v| **v > maximum * 0.3).count() < 4 {
@@ -54,40 +104,43 @@ pub fn detect(energy: &[f32], step: f64) -> Option<BeatGrid> {
         .get(intervals.len() / 2)
         .map(|interval| {
             let mut bpm = 60.0 / interval;
-            while bpm < 70.0 {
+            while bpm < 75.0 {
                 bpm *= 2.0;
             }
-            while bpm > 180.0 {
+            while bpm > 185.0 {
                 bpm /= 2.0;
             }
             bpm
         })
         .unwrap_or(120.0);
+    // Autocorrelate once per integer lag, then interpolate for fractional BPM.
+    let max_lag = ((3.0 * 60.0 / 55.0 / step).ceil() as usize + 1).min(onsets.len() - 1);
+    let correlations: Vec<f32> = (0..=max_lag)
+        .map(|lag| {
+            let tail = &onsets[lag..];
+            let sum = onsets.iter().zip(tail).map(|(a, b)| a * b).sum::<f32>();
+            sum / power * onsets.len() as f32 / tail.len() as f32
+        })
+        .collect();
     let correlation = |lag: f64| -> f32 {
-        let lag_int = lag.floor() as usize;
-        if lag_int + 1 >= onsets.len() {
-            return 0.0;
-        }
+        let index = lag.floor() as usize;
         let fraction = lag.fract() as f32;
-        let count = onsets.len() - lag_int - 1;
-        let sum: f32 = (0..count)
-            .map(|i| {
-                onsets[i]
-                    * (onsets[i + lag_int] * (1.0 - fraction) + onsets[i + lag_int + 1] * fraction)
-            })
-            .sum();
-        sum / power * onsets.len() as f32 / count as f32
+        correlations
+            .get(index)
+            .zip(correlations.get(index + 1))
+            .map_or(0.0, |(&a, &b)| a + fraction * (b - a))
     };
     let mut best = (0.0_f32, 120.0_f32);
-    for candidate in 700..=1800 {
+    for candidate in 550..=2000 {
         let bpm = candidate as f32 / 10.0;
         let lag = 60.0 / bpm as f64 / step;
         let score =
             (correlation(lag) + 0.5 * correlation(2.0 * lag) + 0.25 * correlation(3.0 * lag))
                 / 1.75;
         // Prefer strong-onset spacing when half-tempo candidates are equally periodic.
-        let score = score
-            * (1.0 + 0.02 * (-0.5 * ((bpm as f64 - interval_bpm) / 8.0).powi(2)).exp() as f32);
+        let interval_prior = (-0.5 * ((bpm as f64 - interval_bpm) / 9.0).powi(2)).exp() as f32;
+        let tempo_prior = (-0.5 * ((bpm / 120.0).log2() / 0.5).powi(2)).exp();
+        let score = score * (1.0 + 0.07 * interval_prior + 0.035 * tempo_prior);
         if score > best.0 {
             best = (score, bpm);
         }
@@ -96,7 +149,7 @@ pub fn detect(energy: &[f32], step: f64) -> Option<BeatGrid> {
         return None;
     }
     let period = 60.0 / best.1 as f64;
-    let bins = (period / step).round() as usize;
+    let bins = ((period / step).round() as usize).max(1);
     let mut phases = vec![0.0_f32; bins];
     for (i, onset) in onsets.iter().enumerate() {
         let bin =
@@ -206,6 +259,25 @@ mod tests {
         }
         assert!(detect(&vec![0.0; 4000], 0.01).is_none());
         assert!(detect(&vec![0.5; 4000], 0.01).is_none());
+    }
+
+    #[test]
+    fn bass_pulse_anchors_grid_against_louder_offbeat_hats() {
+        let mut energy = std::array::from_fn(|_| vec![0.0; 3600]);
+        let period = 60.0 / 124.0;
+        for beat in 0..70 {
+            let time = 0.17 + beat as f64 * period;
+            let kick = (time * 100.0).round() as usize;
+            let hat = ((time + period * 0.5) * 100.0).round() as usize;
+            if beat % 7 != 3 {
+                energy[0][kick] = 0.22;
+            }
+            energy[1][kick] = 0.12;
+            energy[2][hat] = 0.91;
+        }
+        let grid = detect_bands(&energy, 0.01).unwrap();
+        assert!((grid.bpm - 124.0).abs() < 0.6, "{grid:?}");
+        assert!((grid.offset - 0.17).abs() < 0.025, "{grid:?}");
     }
 
     #[test]

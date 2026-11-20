@@ -13,6 +13,8 @@ use std::{
     sync::mpsc::{self, Receiver},
 };
 
+const FILE_ROW_HEIGHT: f32 = 22.0;
+
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub path: PathBuf,
@@ -445,7 +447,13 @@ impl Browser {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, active: usize, ctx: &egui::Context) -> Option<Event> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        active: usize,
+        deck_order: &[usize],
+        ctx: &egui::Context,
+    ) -> Option<Event> {
         self.poll();
         let mut navigation = None;
         let mut event = None;
@@ -487,7 +495,7 @@ impl Browser {
                 {
                     event = self.selected_path().map(Event::Playlist);
                 }
-                for deck in crate::decks::ORDER.into_iter().rev() {
+                for &deck in deck_order.iter().rev() {
                     if ui
                         .add_enabled(
                             self.selected_path().is_some(),
@@ -507,7 +515,7 @@ impl Browser {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.path_edit)
-                    .desired_width((ui.available_width() - 155.0).max(100.0)),
+                    .desired_width((ui.available_width() - 400.0).max(100.0)),
             );
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 navigation = Some(PathBuf::from(&self.path_edit));
@@ -521,8 +529,7 @@ impl Browser {
                 self.settings.favorites.push(self.settings.folder.clone());
                 self.dirty = true;
             }
-        });
-        ui.horizontal(|ui| {
+            ui.separator();
             let selected = self.selected_path();
             let ready = selected.as_ref().is_some_and(|path| {
                 self.entries
@@ -560,8 +567,6 @@ impl Browser {
             {
                 self.start_analysis(missing, false, ctx);
             }
-            ui.label(RichText::new("SQLite database").small().weak())
-                .on_hover_text(self.database.display().to_string());
         });
         if let Some(job) = &self.job {
             ui.horizontal(|ui| {
@@ -705,19 +710,20 @@ impl Browser {
                     ui.label("No matching music files or folders.");
                 }
                 let mut activate = false;
+                ui.spacing_mut().item_spacing.y = 3.0;
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("music-files")
                     .max_height(height)
                     .auto_shrink([false, false]);
                 if self.scroll_selection {
                     scroll = scroll.vertical_scroll_offset(
-                        (self.selected.unwrap_or(0) as f32 * (27.0 + ui.spacing().item_spacing.y)
+                        (self.selected.unwrap_or(0) as f32 * (FILE_ROW_HEIGHT + ui.spacing().item_spacing.y)
                             - height * 0.5)
                             .max(0.0),
                     );
                     self.scroll_selection = false;
                 }
-                scroll.show_rows(ui, 27.0, self.filtered.len(), |ui, range| {
+                scroll.show_rows(ui, FILE_ROW_HEIGHT, self.filtered.len(), |ui, range| {
                     for row in range {
                         let entry = &self.entries[self.filtered[row]];
                         let row_response = ui.horizontal(|ui| {
@@ -727,7 +733,7 @@ impl Browser {
                                 entry.name.clone()
                             };
                             let (rect, _) = ui.allocate_exact_size(
-                                Vec2::new((ui.available_width() - 432.0).max(80.0), 27.0),
+                                Vec2::new((ui.available_width() - 432.0).max(80.0), FILE_ROW_HEIGHT),
                                 egui::Sense::hover(),
                             );
                             if self.selected == Some(row) {
@@ -755,15 +761,15 @@ impl Browser {
                             let duration = summary.map_or("—".into(), |a| { let seconds = a.duration_ms / 1000; format!("{}:{:02}", seconds / 60, seconds % 60) });
                             let bpm = summary.and_then(|a| a.bpm()).map_or("—".into(), |b| format!("{b:.1}"));
                             let key = summary.and_then(|a| a.key);
-                            ui.add_sized([58.0, 27.0], egui::Label::new(duration));
-                            ui.add_sized([55.0, 27.0], egui::Label::new(bpm));
-                            ui.add_sized([100.0, 27.0], egui::Label::new(key.map_or("—".into(), |k| k.label())))
+                            ui.add_sized([58.0, FILE_ROW_HEIGHT], egui::Label::new(duration));
+                            ui.add_sized([55.0, FILE_ROW_HEIGHT], egui::Label::new(bpm));
+                            ui.add_sized([100.0, FILE_ROW_HEIGHT], egui::Label::new(key.map_or("—".into(), |k| k.label())))
                                 .on_hover_text(key.map_or("No reliable key detected, or the file has not been analyzed yet.".into(), |k| format!("Estimated key: {}. Profile match {:.0}%; not guaranteed.", k.label(), k.confidence * 100.0)));
                             let working = self.job.as_ref().is_some_and(|job| job.current.as_ref() == Some(&entry.path));
                             let state = if entry.directory { "" } else if working { "Analyzing …" } else if self.queued.contains(&entry.path) { "Queued" } else if entry.analysis_error.is_some() { "Error" } else if summary.is_some() { "Analyzed" } else if entry.stale { "Changed" } else { "Pending" };
-                            ui.add_sized([78.0, 27.0], egui::Label::new(RichText::new(state).small().color(if entry.analysis_error.is_some() { egui::Color32::LIGHT_RED } else { ui.visuals().weak_text_color() }))).on_hover_text(entry.analysis_error.as_deref().unwrap_or(state));
-                            ui.add_sized([48.0, 27.0], egui::Label::new(if entry.directory { "DIR".into() } else { entry.path.extension().unwrap_or_default().to_string_lossy().to_uppercase() }));
-                            ui.add_sized([57.0, 27.0], egui::Label::new(if entry.directory { "".into() } else { format!("{:.1} MB", entry.bytes as f64 / 1_000_000.0) }));
+                            ui.add_sized([78.0, FILE_ROW_HEIGHT], egui::Label::new(RichText::new(state).small().color(if entry.analysis_error.is_some() { egui::Color32::LIGHT_RED } else { ui.visuals().weak_text_color() }))).on_hover_text(entry.analysis_error.as_deref().unwrap_or(state));
+                            ui.add_sized([48.0, FILE_ROW_HEIGHT], egui::Label::new(if entry.directory { "DIR".into() } else { entry.path.extension().unwrap_or_default().to_string_lossy().to_uppercase() }));
+                            ui.add_sized([57.0, FILE_ROW_HEIGHT], egui::Label::new(if entry.directory { "".into() } else { format!("{:.1} MB", entry.bytes as f64 / 1_000_000.0) }));
                         });
                         let response = ui.interact(
                             row_response.response.rect.intersect(ui.clip_rect()),

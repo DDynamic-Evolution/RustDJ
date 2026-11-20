@@ -22,7 +22,7 @@ fn await_load(deck: &mut Deck, audio: &Audio) -> Option<Track> {
 }
 
 #[test]
-#[ignore = "requires a Windows audio output device; runs silently"]
+#[ignore = "requires a working default audio output; runs silently"]
 fn two_decks_play_pause_seek_cue_and_recover_from_failed_load() {
     let audio = Audio::default();
     assert!(audio.stream.is_some(), "{:?}", audio.error);

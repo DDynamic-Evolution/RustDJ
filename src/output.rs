@@ -1,3 +1,4 @@
+use crate::broadcast_mix::{Limiter, LimiterControl};
 use rodio::{
     OutputStream, OutputStreamBuilder, Source,
     cpal::{
@@ -35,16 +36,33 @@ struct MeteredBus {
     capture: Option<Arc<crate::capture::MasterCapture>>,
     frame: [f32; 2],
     equalizer: Option<crate::equalizer::Processor>,
+    limiter: Option<(Arc<LimiterControl>, Limiter)>,
+    pending_right: Option<f32>,
 }
 impl Iterator for MeteredBus {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        let mut value = self.source.next()?;
-        if let Some(eq) = &mut self.equalizer
-            && (self.pair * 2..self.pair * 2 + 2).contains(&self.channel)
-        {
-            value = eq.process(value, (self.channel - self.pair * 2) as usize);
-        }
+        let value = if let Some(right) = self.pending_right.take() {
+            right
+        } else if self.channel == self.pair * 2 && self.limiter.is_some() {
+            let mut pair = [self.source.next()?, self.source.next()?];
+            if let Some(eq) = &mut self.equalizer {
+                pair = [eq.process(pair[0], 0), eq.process(pair[1], 1)];
+            }
+            if let Some((control, limiter)) = &mut self.limiter {
+                pair = limiter.process(control, pair);
+            }
+            self.pending_right = Some(pair[1]);
+            pair[0]
+        } else {
+            let value = self.source.next()?;
+            match &mut self.equalizer {
+                Some(eq) if (self.pair * 2..self.pair * 2 + 2).contains(&self.channel) => {
+                    eq.process(value, (self.channel - self.pair * 2) as usize)
+                }
+                _ => value,
+            }
+        };
         if value.is_finite() && (self.pair * 2..self.pair * 2 + 2).contains(&self.channel) {
             self.peaks.values[(self.channel - self.pair * 2) as usize]
                 .fetch_max(value.abs().to_bits(), Ordering::Relaxed);
@@ -98,6 +116,8 @@ fn metered_bus(
             capture: None,
             frame: [0.0; 2],
             equalizer: None,
+            limiter: None,
+            pending_right: None,
         },
     )
 }
@@ -156,6 +176,7 @@ pub struct Audio {
     phones_peaks: Arc<StereoPeaks>,
     pub capture: Arc<crate::capture::MasterCapture>,
     pub master_eq: Arc<crate::equalizer::Params>,
+    pub limiter: Arc<LimiterControl>,
 }
 
 impl Default for Audio {
@@ -239,6 +260,7 @@ impl Audio {
                 phones_peaks: Arc::default(),
                 capture: Arc::new(crate::capture::MasterCapture::new(44100)),
                 master_eq: Arc::default(),
+                limiter: Arc::default(),
             },
         }
     }
@@ -286,6 +308,9 @@ impl Audio {
             master_eq.clone(),
             stream.config().sample_rate(),
         ));
+        let limiter = Arc::new(LimiterControl::default());
+        master_source.limiter =
+            Some((limiter.clone(), Limiter::new(stream.config().sample_rate())));
         stream.mixer().add(master_source);
         let phones_output = if shared {
             Some(&stream)
@@ -319,6 +344,7 @@ impl Audio {
             phones_peaks,
             capture,
             master_eq,
+            limiter,
         })
     }
 
@@ -411,7 +437,7 @@ mod tests {
             equalizer::{FREQUENCIES, Params, Processor, Settings as EqSettings},
             streamer::{Broadcaster, Phase, StreamSettings},
         };
-        use std::{path::Path, thread, time::Instant};
+        use std::{thread, time::Instant};
         fn rms(samples: &[f32]) -> f32 {
             (samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32).sqrt()
         }
@@ -449,7 +475,7 @@ mod tests {
         }
         let directory = tempfile::Builder::new()
             .prefix("fourdeck17-")
-            .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("work"))
+            .tempdir()
             .unwrap();
         let mut saved = crate::settings::Settings::default();
         saved.master_eq.enabled = true;
@@ -544,7 +570,7 @@ mod tests {
             capture::{MasterCapture, PcmBuffer},
             streamer::{Broadcaster, Phase, StreamSettings},
         };
-        use std::{path::Path, thread, time::Instant};
+        use std::{thread, time::Instant};
         fn wait(mut condition: impl FnMut() -> bool) {
             let end = Instant::now() + Duration::from_secs(5);
             while !condition() {
@@ -554,7 +580,7 @@ mod tests {
         }
         let directory = tempfile::Builder::new()
             .prefix("streamer16-")
-            .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("work"))
+            .tempdir()
             .unwrap();
         let settings = StreamSettings {
             recording_dir: directory.path().into(),
@@ -722,6 +748,30 @@ mod tests {
         let [left, right] = peaks.take();
         assert!((left - 1.2).abs() < 0.00001 && (right - 0.4).abs() < 0.00001);
     }
+    #[test]
+    fn master_limiter_sends_the_same_linked_stereo_to_capture_and_output() {
+        let rate = 48_000;
+        let (bus, mut source) = metered_bus(4, rate, 1, Arc::default());
+        let capture = Arc::new(crate::capture::MasterCapture::new(rate));
+        let limiter = Arc::new(LimiterControl::default());
+        limiter.set(true);
+        source.capture = Some(capture.clone());
+        source.limiter = Some((limiter, Limiter::new(rate)));
+        capture.stream.begin();
+        bus.add(rodio::buffer::SamplesBuffer::new(
+            4,
+            rate,
+            [0.1, -0.2, 1.5, -0.75],
+        ));
+        let played: Vec<_> = source.take(4).collect();
+        let mut captured = Vec::new();
+        assert_eq!(capture.stream.drain(&mut captured, 1), 1);
+        assert_eq!(&played[..2], &[0.1, -0.2]);
+        assert_eq!(captured, played[2..]);
+        assert!((captured[0] - 0.891_250_9).abs() < 0.0001);
+        assert!((captured[1] * 2.0 + captured[0]).abs() < 0.0001);
+    }
+
     #[test]
     fn master_and_cue_have_no_channel_leakage() {
         let input = rodio::buffer::SamplesBuffer::new(2, 48000, vec![0.2, 0.4, 0.6, 0.8]);

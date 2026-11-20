@@ -94,6 +94,7 @@ pub enum Action {
     PhonesMix,
     Browse,
     Open,
+    Jingle(usize),
 }
 
 impl Action {
@@ -140,6 +141,7 @@ impl Action {
                     "Controller: switch Deck 2/4".into()
                 };
             }
+            Self::Jingle(slot) => return format!("Jingle {}", slot.saturating_add(1)),
             Self::SelectDeck(d) => return format!("Select Deck {}", d + 1),
             Self::FxToggle(d, slot) => {
                 return format!("{}: FX {}", d + 1, slot.saturating_add(1));
@@ -163,7 +165,7 @@ impl Action {
             _ => {}
         }
         let (name, deck) = match self {
-            Self::SelectDeck(_) | Self::DeckLayer(_) => unreachable!(),
+            Self::SelectDeck(_) | Self::DeckLayer(_) | Self::Jingle(_) => unreachable!(),
             Self::Play(d) => ("Play/Pause", Some(d)),
             Self::Cue(d) => ("Cue", Some(d)),
             Self::SetCue(d) => ("Set cue", Some(d)),
@@ -217,6 +219,7 @@ impl Action {
             Self::Browse,
             Self::Open,
         ];
+        actions.extend((0..crate::jingles::COUNT).map(Self::Jingle));
         for d in 0..crate::decks::COUNT {
             actions.extend([
                 Self::SelectDeck(d),
@@ -1362,7 +1365,7 @@ mod tests {
         };
         assert_eq!(ORDER.map(|i| i + 1), [1, 3, 4, 2]);
         for width in [1268.0, 1668.0, 1908.0] {
-            let (mixer, deck) = crate::app::console_dimensions(width);
+            let (mixer, deck) = crate::app::console_dimensions(width, crate::decks::Layout::Four);
             assert!(deck >= 200.0 && mixer >= 400.0);
             assert!((mixer + deck * 4.0 + 24.0 - width).abs() < 0.01);
         }
@@ -1949,6 +1952,10 @@ mod tests {
         );
         assert_eq!(
             mapper.decode([0x90, 2, 127], &map),
+            vec![(Action::Sync(0), 1.0)]
+        );
+        assert_eq!(
+            mapper.decode([0x92, 2, 127], &map),
             vec![(Action::Sync(2), 1.0)]
         );
     }

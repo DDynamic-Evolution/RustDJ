@@ -8,19 +8,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const ANALYSIS_VERSION: i64 = 1;
+pub const ANALYSIS_VERSION: i64 = 2;
 
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("RUSTDJ_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("RustDJ")
-        });
-    base.join("library.sqlite3")
+    if let Some(base) = std::env::var_os("RUSTDJ_DATA_DIR") {
+        return PathBuf::from(base).join("library.sqlite3");
+    }
+    #[cfg(target_os = "linux")]
+    return crate::settings::linux_data_path("XDG_DATA_HOME", ".local/share", "library.sqlite3");
+
+    #[cfg(not(target_os = "linux"))]
+    return crate::settings::config_dir().join("library.sqlite3");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +105,14 @@ pub enum Lookup {
     Fresh(Summary),
 }
 
+pub struct HistoryEntry {
+    pub local_time: String,
+    pub utc_time: String,
+    pub title: String,
+    pub path: String,
+    pub deck: usize,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -140,6 +146,14 @@ impl Database {
             CREATE TABLE IF NOT EXISTS colour_waveforms (
                 path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, modified_ns TEXT NOT NULL,
                 version INTEGER NOT NULL, frames INTEGER NOT NULL, step REAL NOT NULL, data BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS beatgrid_corrections (
+                path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, modified_ns TEXT NOT NULL,
+                bpm REAL NOT NULL, anchor REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS play_history (
+                id INTEGER PRIMARY KEY, played_at INTEGER NOT NULL, title TEXT NOT NULL,
+                path TEXT NOT NULL, deck INTEGER NOT NULL
             );",
             )
             .map_err(|e| format!("Could not initialize music database: {e}"))?;
@@ -149,6 +163,83 @@ impl Database {
                 .map_err(|e| e.to_string())?;
         }
         Ok(Self { connection })
+    }
+
+    pub fn grid_correction(
+        &self,
+        path: &Path,
+        file: &Fingerprint,
+    ) -> Result<Option<BeatGrid>, String> {
+        self.connection.query_row(
+            "SELECT bpm, anchor FROM beatgrid_corrections WHERE path=?1 AND file_size=?2 AND modified_ns=?3",
+            params![path_key(path), file.bytes, file.modified_ns],
+            |row| Ok(BeatGrid { bpm: row.get(0)?, offset: row.get(1)?, confidence: 1.0 }),
+        ).optional().map_err(|error| error.to_string())
+    }
+
+    pub fn save_grid_correction(
+        &self,
+        path: &Path,
+        file: &Fingerprint,
+        grid: Option<BeatGrid>,
+    ) -> Result<(), String> {
+        if let Some(grid) = grid {
+            if !(40.0..=250.0).contains(&grid.bpm) || !grid.offset.is_finite() || grid.offset < 0.0
+            {
+                return Err("Enter a valid tempo and first beat.".into());
+            }
+            self.connection.execute(
+                "INSERT INTO beatgrid_corrections VALUES(?1,?2,?3,?4,?5) ON CONFLICT(path) DO UPDATE SET
+                 file_size=excluded.file_size,modified_ns=excluded.modified_ns,bpm=excluded.bpm,anchor=excluded.anchor",
+                params![path_key(path), file.bytes, file.modified_ns, grid.bpm, grid.offset],
+            ).map_err(|error| error.to_string())?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM beatgrid_corrections WHERE path=?1 AND file_size=?2 AND modified_ns=?3",
+                params![path_key(path), file.bytes, file.modified_ns],
+            ).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn log_play(
+        &self,
+        title: &str,
+        path: &Path,
+        deck: usize,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO play_history(played_at,title,path,deck) VALUES(?1,?2,?3,?4)",
+                params![timestamp, title, path.to_string_lossy(), deck],
+            )
+            .map_err(|error| format!("Could not save play history: {error}"))?;
+        Ok(())
+    }
+
+    pub fn history(&self, limit: i64) -> Result<Vec<HistoryEntry>, String> {
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT datetime(played_at,'unixepoch','localtime'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ',played_at,'unixepoch'),title,path,deck
+             FROM play_history ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([limit], |row| {
+                Ok(HistoryEntry {
+                    local_time: row.get(0)?,
+                    utc_time: row.get(1)?,
+                    title: row.get(2)?,
+                    path: row.get(3)?,
+                    deck: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
     }
 
     pub fn lookup(&self, path: &Path, identity: &Fingerprint) -> Result<Lookup, String> {
@@ -316,6 +407,43 @@ fn decode_peaks(bytes: &[u8]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    #[test]
+    fn saved_grid_and_play_history_survive_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.sqlite3");
+        let track = directory.path().join("track.mp3");
+        let identity = Fingerprint {
+            bytes: 44,
+            modified_ns: "1".into(),
+        };
+        let grid = BeatGrid {
+            bpm: 128.25,
+            offset: 2.175,
+            confidence: 1.0,
+        };
+        {
+            let db = Database::open(&path).unwrap();
+            db.save_grid_correction(&track, &identity, Some(grid))
+                .unwrap();
+            db.log_play("Track", &track, 2, 1_762_000_000).unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let restored = db.grid_correction(&track, &identity).unwrap().unwrap();
+        assert_eq!((restored.bpm, restored.offset), (grid.bpm, grid.offset));
+        let different = Fingerprint {
+            bytes: 45,
+            ..identity.clone()
+        };
+        assert!(db.grid_correction(&track, &different).unwrap().is_none());
+        db.save_grid_correction(&track, &identity, None).unwrap();
+        assert!(db.grid_correction(&track, &identity).unwrap().is_none());
+        let history = db.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].deck, 2);
+        assert_eq!(history[0].title, "Track");
+        assert!(history[0].utc_time.ends_with('Z'));
+    }
+
     #[test]
     fn sqlite_persists_full_analysis_and_invalidates_changed_files_and_versions() {
         let temporary = tempfile::tempdir().unwrap();

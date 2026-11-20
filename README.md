@@ -2,9 +2,9 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.23.1
+# RustDJ 0.23.8
 
-RustDJ is a native DJ application for Windows, written in Rust. It combines four
+RustDJ is a native DJ application for Windows and Linux, written in Rust. It combines four
 decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
 streaming and MP3 recording in one desktop application.
 
@@ -31,9 +31,16 @@ streaming and MP3 recording in one desktop application.
 
 ## Getting started
 
-Build the application as described under [Building from source](#building-from-source),
-then start `target\release\rustdj.exe`. The release executable does not require
-Rust to be installed on the playback computer.
+On Linux Mint, Ubuntu or Debian, install the Debian package with
+`sudo apt install ./rustdj_0.23.8_amd64.deb` and launch **RustDJ** from the
+application menu or run `rustdj`. Use the package matching your system
+architecture. The package built on Linux Mint 22.3 targets its Ubuntu 24.04
+base. For distributions with older system libraries, build the package on
+the target distribution.
+
+On Windows, [build from source](#building-from-source) and start
+`target\release\rustdj.exe`. Neither installed Linux packages nor Windows
+release executables require Rust on the playback computer.
 
 1. Open **Audio / Outputs** and select the master output for your speakers.
 2. Select a separate headphone device or a different stereo channel pair.
@@ -47,7 +54,13 @@ RustDJ; automatic connection is enabled by default.
 
 ## Layout and mixing
 
-Decks, mixer channels and scrolling waveform lanes follow the same order:
+Use **2 Decks** and **4 Decks** in the header to switch layouts. The two-deck
+layout shows Decks 1 and 2, their mixer channels, waveforms and load buttons.
+Pause Decks 3 and 4 before switching. Their tracks stay loaded and are
+available again when you return to four decks. RustDJ remembers the layout.
+
+In the four-deck layout, decks, mixer channels and scrolling waveform lanes
+follow the same order:
 
 ```text
 Deck 1   Deck 3   [ central mixer ]   Deck 4   Deck 2
@@ -101,15 +114,22 @@ Changes are smoothed and affect both master and cue audio.
 
 ## Music browser and analysis
 
-The browser shows drives, folders and supported music files. Use **Up** to open
+Use **Library** in the header to give the music browser and session list more
+room while tracks continue playing. Click it again to restore the decks,
+mixer and scrolling waveforms. The browser shows drives, folders and supported
+music files. Use **Up** to open
 the parent folder, **Go** to open a typed path, and **Favorite +** to bookmark the
 current folder. The last folder and favorites are saved between sessions.
 Double-click a folder to open it. Search filters the current folder without
 recursively scanning subfolders.
 
 The file list includes duration, BPM, key, analysis state, format and size.
-BPM and key detection are estimates; check them before relying on Sync or
-harmonic mixing. Key information includes conventional notation and Camelot.
+Beat analysis detects transients separately in the bass, mid and high bands.
+It estimates a constant tempo from recurring accents and aligns the grid with
+the detected beats. This follows the general onset and autocorrelation
+approach described in [Ellis's beat tracking paper](https://labrosa.ee.columbia.edu/~dpwe/pubs/Ellis06-beattrack.pdf).
+Check the grid before relying on Sync, especially for tracks with a varying
+tempo. Key information includes conventional notation and Camelot.
 
 - **Analyze selection** analyzes selected audio.
 - **Reanalyze selection** replaces the cached result for that selection.
@@ -150,7 +170,7 @@ An insertion line shows where a playlist item will be placed. Dragging within a
 playlist reorders it; dragging onto a deck loads it. Adding tracks to a list does
 not start playback or remove the original files. Escape cancels an active drag.
 
-Files from Windows Explorer can also be dropped onto decks and lists. Dropping
+Files from the desktop file manager can also be dropped onto decks and lists. Dropping
 multiple files onto a deck loads up to four decks in display order, starting at
 the target. Dropping a folder opens it in the music browser.
 
@@ -186,8 +206,8 @@ the cueing position by 15 ms per MIDI tick.
 
 **Audio / Outputs** lets you choose the master device and a separate monitoring
 output. With two stereo devices, select channels 1/2 on each. With a multichannel
-interface, use different pairs, such as master 1/2 and phones 3/4. The Windows
-driver must expose the needed channels. Overlapping pairs on one device are
+interface, use different pairs, such as master 1/2 and phones 3/4. The audio backend must expose the needed channels. Linux uses ALSA for audio
+and MIDI. Overlapping pairs on one device are
 rejected. Missing devices are not silently replaced with other outputs.
 
 The **MASTER / PHONES** mixer tab also provides a headphone device/pair selector.
@@ -275,9 +295,34 @@ The Rust implementation is independent. See also the
 [DJ-202 mixer controls](https://virtualdj.com/manuals/hardware/roland/dj202/layout/mixer.html).
 A complete physical test of every DJ-202 control is still outstanding.
 
+## Microphone and external audio inputs
+
+Choose the microphone device and channel under **Audio Inputs → Microphone**.
+Use **MIC OFF / MIC ON** in the mixer to toggle it during a set. The adjacent
+slider sets the microphone level, and the meter shows that signal after the
+slider. The microphone feeds the master mix, including the stream and recording,
+and starts switched off each time RustDJ opens.
+
+Open **Audio Inputs** in the header to set up two independent inputs for
+microphones, line-in or USB audio interfaces. Choose an input device and a
+mono channel or stereo pair, adjust **Input level**, then click **Enable input**.
+The inputs feed the master mix and are included in SHOUTcast and MP3 recordings.
+They are also audible in the headphone program mix. The input settings are
+remembered, and both inputs start disabled when RustDJ opens.
+
 ## SHOUTcast streaming and MP3 recording
 
-Click **STREAMER** in the central mixer to open **SHOUTcast / MP3 Recording**.
+Start or stop a stream or MP3 recording from the main window header. **STREAM**
+and **REC** show the current state and elapsed time. Hover over either status for
+details, including the recording file or connection errors. Click **STREAMER**
+in the central mixer to open **SHOUTcast / MP3 Recording** and edit its settings.
+
+Use **New profile** in **STREAMER** to save a second destination. Give it a
+name, enter its host, ports and stream ID, and select the desired profile
+before starting the broadcast. RustDJ remembers the selected profile. Each
+profile has its own protected password. The previous single destination
+becomes the **Default** profile.
+
 Both features capture the stereo master after channel processing, crossfader,
 master level and master EQ. Direct headphone cue is excluded. Muting the
 software master also mutes the stream and recording.
@@ -316,18 +361,42 @@ Bitrate changes apply to newly started sessions. Streaming and recording run
 independently. A stream connection failure does not stop an active recording.
 
 Choose a recording folder and click **Start MP3 recording**. The default for new
-settings is `Music\RustDJ-Recordings` in the Windows user folder. Files are named
+settings is `Music/RustDJ-Recordings` in your home folder. Files are named
 `RustDJ-Master-<timestamp>-<number>.mp3`; existing files are not overwritten.
 **Stop recording** finalizes the MP3. Close normally to allow pending data to flush.
 
 Settings are saved, including transport security, ports, station details, title options, bitrate and
-recording folder. The password is encrypted with Windows DPAPI for the current
-user account and restored at startup. A password restoration error is shown;
-there is no plaintext fallback. Streaming and recording never start automatically.
+recording folder. Windows protects the password with DPAPI and restores it
+at startup. On Linux, enter the source password and click **Save password**
+under **STREAMER**. RustDJ restores it from the system keyring on startup.
+The desktop needs a Secret Service provider, such as GNOME Keyring.
+**Remove saved password** deletes the selected profile's keyring entry.
+Streaming and recording never start automatically.
 
 Audio capture uses bounded buffers and background encoding/network workers;
 the audio callback does not perform disk or network I/O. Overflow or connection
 errors stop the affected output and appear in the streamer window.
+
+## Live tools
+
+- **Talkover** in the header lowers the deck and external-input music while
+  you speak into the enabled microphone. Set the microphone threshold,
+  reduction and return time in the Talkover window.
+- **Jingles** has four saved audio pads and a dedicated level. Use **Choose
+  file …** to assign a clip. Trigger it with **Play** or MIDI Learn's **Jingle
+  1–4** actions. Jingles go to the master, stream and recorder.
+- **Reconnect after a connection drop** under **STREAMER** makes up to five
+  attempts after loss of an active broadcast. The header shows retry status,
+  **Stop stream** cancels it, and recording continues independently.
+- **History** lists recent plays in local time and exports the full list as CSV
+  with UTC timestamps. RustDJ logs the first two continuous seconds in the
+  master mix for each loaded track.
+- Open **Beatgrid editor …** in the deck's BPM menu to set the tempo and first
+  beat. **Save beatgrid** stores the correction for the file. **Use detected
+  grid** removes the correction. The editor uses a fixed tempo.
+- **Limiter** in the mixer limits stereo sample peaks to −1 dBFS after the
+  master EQ. Speakers, stream and recording share the limited signal. **LIM**
+  displays the current gain reduction in dB.
 
 ## Keyboard shortcuts
 
@@ -353,15 +422,36 @@ levels, crossfader state, master EQ and streamer settings. Existing settings
 continue to work after the English-language update; user paths and titles are
 not translated or renamed.
 
-Library analyses, waveform data and hotcues are stored in SQLite under the
-application data folder. The database code also supports `RUSTDJ_DATA_DIR` for
-an explicit library data location.
+On Linux, settings are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/RustDJ/settings.json`.
+Library analyses, waveform data and hotcues are stored in SQLite under
+`${XDG_DATA_HOME:-$HOME/.local/share}/RustDJ/library.sqlite3`. An existing database
+in `~/.config/RustDJ` remains usable. Set `RUSTDJ_DATA_DIR` to choose a different
+library directory. On Windows the database defaults to `%APPDATA%\RustDJ`.
 
 ## Building from source
 
-Requirements: Windows, Rust with the MSVC target, Visual Studio C++ Build Tools
-and the Windows SDK. `rust-toolchain.toml` pins Rust 1.99.1 with rustfmt and
-Clippy. Cargo downloads dependencies using the versions in `Cargo.lock`.
+`rust-toolchain.toml` pins Rust 1.99.1 with rustfmt and Clippy. Cargo downloads
+dependencies using the versions in `Cargo.lock`.
+
+### Linux
+
+Install the build dependencies on Debian-based systems, then run Cargo or
+build a Debian package. Run these commands from the repository root.
+
+```bash
+sudo apt install build-essential pkg-config libasound2-dev autoconf automake libtool libsecret-1-0 dpkg-dev python3
+cargo run --locked
+./scripts/build-deb.sh
+```
+
+The package is written to `outputs/` by default. Pass a directory as the
+first argument to put it elsewhere. Build on the oldest Linux distribution
+you intend to support so the binary uses that system's libraries.
+
+### Windows
+
+Install Rust with the MSVC target, Visual Studio C++ Build Tools and the
+Windows SDK.
 
 ```powershell
 git clone https://github.com/DDynamic-Evolution/RustDJ.git

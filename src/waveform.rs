@@ -197,6 +197,10 @@ impl Builder {
         }
     }
     pub fn push(&mut self, sample: f32) {
+        self.push_with_energy(sample);
+    }
+
+    pub(crate) fn push_with_energy(&mut self, sample: f32) -> Option<[f64; 3]> {
         let sample = if sample.is_finite() { sample } else { 0.0 };
         self.min = self.min.min(sample.clamp(-1.0, 1.0));
         self.max = self.max.max(sample.clamp(-1.0, 1.0));
@@ -211,8 +215,11 @@ impl Builder {
         self.cursor = (self.cursor + 1) % self.filters.len();
         self.count += 1;
         if self.count >= self.bucket {
+            let energy = self.energy;
             self.flush();
+            return Some(energy);
         }
+        None
     }
     fn flush(&mut self) {
         if self.count == 0 {

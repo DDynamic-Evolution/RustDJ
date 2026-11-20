@@ -1,4 +1,16 @@
-//! Password persistence protected by Windows DPAPI for the current user.
+//! Protected stream password storage for the current user.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+
+#[cfg(windows)]
+pub const PASSWORD_HINT: &str =
+    "Saved using Windows encryption for your user account and restored on startup.";
+#[cfg(target_os = "linux")]
+pub const PASSWORD_HINT: &str =
+    "Use Save password to store it in your system keyring and restore it on startup.";
+#[cfg(not(any(windows, target_os = "linux")))]
+pub const PASSWORD_HINT: &str = "The stream password is kept for this session only.";
+
 const MARKER: &[u8] = b"RustDJ source password v1\0";
 
 pub fn protect(password: &str) -> Result<Vec<u8>, String> {
@@ -106,5 +118,5 @@ fn transform(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 fn transform(_data: &[u8], _encrypt: bool) -> Result<Vec<u8>, String> {
-    Err("Protected storage of stream passwords requires Windows.".into())
+    Err("This platform cannot restore the saved stream password. Enter it for this session.".into())
 }

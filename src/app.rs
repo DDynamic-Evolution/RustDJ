@@ -1,25 +1,30 @@
 use crate::{
     audio::{Audio, Deck},
     beat::{BeatGrid, sync_plan},
+    broadcast_mix::{Talkover, TalkoverSettings},
     browser::{Browser, Event as BrowserEvent},
     controller_profiles::{ProfileFile, ProfileId},
-    decks::{COUNT, ORDER},
+    database::{self, Database, HistoryEntry},
+    decks::{COUNT, Layout as DeckLayout},
     dragdrop::{self, Origin, Target as DropTarget, Zones},
     dsp::{bus_gains_with_crossfader, knob_db},
     equalizer::{self, Settings as MasterEqSettings},
+    inputs::{self, InputSettings, LiveInput},
+    jingles::{self, Pads},
     loops::PRESETS as LOOP_PRESETS,
     midi::{self, Action, Midi, Mode},
     output::{self, DeviceInfo, Routing, Target},
     performance::Store as HotcueStore,
     playlist::{Item, Playlist},
     settings::{self, MixSettings, Settings},
-    streamer::{Broadcaster, ConnectionSecurity, Phase, StreamSettings},
+    streamer::{Broadcaster, ConnectionSecurity, Phase, Status, StreamProfile, StreamSettings},
     track,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::{
+    path::PathBuf,
     sync::mpsc::{self, Receiver},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const BG: Color32 = Color32::from_rgb(18, 19, 21);
@@ -28,6 +33,9 @@ const BORDER: Color32 = Color32::from_rgb(61, 64, 69);
 const MUTED: Color32 = Color32::from_rgb(161, 151, 179);
 const PURPLE: Color32 = Color32::from_rgb(174, 119, 255);
 const LIGHT_PURPLE: Color32 = Color32::from_rgb(219, 186, 255);
+const AUX_INPUT_COUNT: usize = 2;
+const MIC: usize = AUX_INPUT_COUNT;
+const INPUT_COUNT: usize = AUX_INPUT_COUNT + 1;
 const WARNING: Color32 = Color32::from_rgb(247, 101, 112);
 
 struct Crossfader {
@@ -69,6 +77,53 @@ impl Crossfader {
     }
 }
 
+#[cfg(target_os = "linux")]
+enum KeyringRequest {
+    Load,
+    Save(String),
+    Remove,
+    DeleteProfile,
+}
+
+#[cfg(target_os = "linux")]
+enum KeyringUpdate {
+    Loaded(String),
+    Saved,
+    Removed,
+    ProfileDeleted,
+}
+
+#[cfg(target_os = "linux")]
+impl KeyringRequest {
+    fn spawn(self, id: u64) -> Receiver<Result<KeyringUpdate, String>> {
+        use crate::credentials::linux as keyring;
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let update = match self {
+                Self::Load => keyring::load(id).map(KeyringUpdate::Loaded),
+                Self::Save(password) => keyring::save(id, password).map(|()| KeyringUpdate::Saved),
+                Self::Remove => keyring::clear(id).map(|()| KeyringUpdate::Removed),
+                Self::DeleteProfile => keyring::load(id).and_then(|password| {
+                    if !password.is_empty() {
+                        keyring::clear(id)?;
+                    }
+                    Ok(KeyringUpdate::ProfileDeleted)
+                }),
+            };
+            let _ = sender.send(update);
+        });
+        receiver
+    }
+}
+
+struct GridEditor {
+    deck: usize,
+    path: PathBuf,
+    grid: BeatGrid,
+    error: Option<String>,
+}
+
 pub struct RustDj {
     logo: egui::TextureHandle,
     decks: [Deck; COUNT],
@@ -88,6 +143,8 @@ pub struct RustDj {
     playlist_tab: bool,
     search: String,
     active: usize,
+    deck_layout: DeckLayout,
+    library_view: bool,
     notice: Option<String>,
     browser: Browser,
     midi: Midi,
@@ -99,8 +156,37 @@ pub struct RustDj {
     bus_levels: [[f32; 2]; 2],
     broadcaster: Broadcaster,
     stream_settings: StreamSettings,
+    stream_profiles: Vec<StreamProfile>,
+    active_stream_profile: usize,
+    stream_profile_serial: u64,
+    confirm_profile_delete: bool,
+    input_settings: [InputSettings; INPUT_COUNT],
+    live_inputs: [Option<LiveInput>; INPUT_COUNT],
+    input_errors: [Option<String>; INPUT_COUNT],
+    mic_peak: f32,
+    talkover_settings: TalkoverSettings,
+    talkover: Talkover,
+    master_limiter: bool,
+    limiter_reduction: f32,
+    jingles: Pads,
+    show_jingles: bool,
+    show_performance: bool,
+    show_history: bool,
+    history: Vec<HistoryEntry>,
+    history_refresh: Instant,
+    audible_since: [Option<Instant>; COUNT],
+    history_logged: [bool; COUNT],
+    grid_editor: Option<GridEditor>,
+    input_devices: Vec<inputs::DeviceInfo>,
+    input_scan: Option<Receiver<Result<Vec<inputs::DeviceInfo>, String>>>,
+    input_scan_error: Option<String>,
+    show_inputs: bool,
     stream_password: String,
     stream_password_error: Option<String>,
+    #[cfg(target_os = "linux")]
+    keyring_task: Option<Receiver<Result<KeyringUpdate, String>>>,
+    #[cfg(target_os = "linux")]
+    keyring_notice: Option<&'static str>,
     show_streamer: bool,
     master_eq: MasterEqSettings,
     show_equalizer: bool,
@@ -138,8 +224,30 @@ impl RustDj {
         }
         let audio = Audio::new(settings.routing.clone());
         audio.master_eq.set(settings.master_eq);
+        audio.limiter.set(settings.master_limiter);
+        if settings.stream_profiles.is_empty() {
+            settings.stream_profiles.push(StreamProfile {
+                id: 0,
+                name: "Default".into(),
+                settings: settings.streamer.clone(),
+            });
+        }
+        let active_stream_profile = settings.stream_profiles.iter()
+            .position(|profile| profile.id == settings.active_stream_profile)
+            .unwrap_or(0);
+        let active_profile = &settings.stream_profiles[active_stream_profile];
+        let stream_profile_serial = settings.stream_profiles.iter()
+            .map(|profile| profile.id)
+            .max()
+            .unwrap_or(0)
+            .max(settings.stream_profile_serial);
+        let mut stream_settings = active_profile.settings.clone();
+        stream_settings.recording_dir = settings.streamer.recording_dir;
+        #[cfg(target_os = "linux")]
+        let (stream_password, stream_password_error) = (String::new(), None);
+        #[cfg(not(target_os = "linux"))]
         let (stream_password, stream_password_error) =
-            match crate::credentials::unprotect(&settings.streamer.protected_password) {
+            match crate::credentials::unprotect(&stream_settings.protected_password) {
                 Ok(password) => (password, None),
                 Err(error) => (String::new(), Some(error)),
             };
@@ -162,6 +270,8 @@ impl RustDj {
             playlist_tab: false,
             search: String::new(),
             active: 0,
+            deck_layout: settings.deck_layout,
+            library_view: false,
             notice,
             browser: Browser::new(settings.browser, ctx),
             midi: Midi::new(settings.bindings, settings.midi),
@@ -172,9 +282,41 @@ impl RustDj {
             hotcue_store: HotcueStore::default(),
             bus_levels: [[0.0; 2]; 2],
             broadcaster: Broadcaster::default(),
-            stream_settings: settings.streamer,
+            stream_settings,
+            active_stream_profile,
+            stream_profile_serial,
+            confirm_profile_delete: false,
+            input_settings: {
+                let [first, second] = settings.inputs;
+                [first, second, settings.microphone]
+            },
+            live_inputs: std::array::from_fn(|_| None),
+            input_errors: std::array::from_fn(|_| None),
+            mic_peak: 0.0,
+            talkover_settings: settings.talkover,
+            talkover: Talkover::default(),
+            master_limiter: settings.master_limiter,
+            limiter_reduction: 0.0,
+            jingles: Pads::new(settings.jingles),
+            show_jingles: false,
+            show_performance: false,
+            show_history: false,
+            history: Vec::new(),
+            history_refresh: Instant::now(),
+            audible_since: [None; COUNT],
+            history_logged: [false; COUNT],
+            grid_editor: None,
+            input_devices: Vec::new(),
+            input_scan: None,
+            input_scan_error: None,
+            show_inputs: false,
             stream_password,
             stream_password_error,
+            #[cfg(target_os = "linux")]
+            keyring_task: Some(KeyringRequest::Load.spawn(active_profile.id)),
+            #[cfg(target_os = "linux")]
+            keyring_notice: None,
+            stream_profiles: settings.stream_profiles,
             show_streamer: false,
             master_eq: settings.master_eq,
             show_equalizer: false,
@@ -202,7 +344,7 @@ impl RustDj {
             (egui::Key::Num3, 2),
             (egui::Key::Num4, 3),
         ] {
-            if ctx.input(|i| i.key_pressed(key)) {
+            if self.deck_layout.contains(deck) && ctx.input(|i| i.key_pressed(key)) {
                 self.active = deck;
             }
         }
@@ -222,8 +364,8 @@ impl RustDj {
             self.decks[self.active].go_to_cue(&self.audio);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            for deck in &mut self.decks {
-                deck.stop(&self.audio);
+            for &index in self.deck_layout.order() {
+                self.decks[index].stop(&self.audio);
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
@@ -234,19 +376,74 @@ impl RustDj {
         }
     }
 
+    fn set_deck_layout(&mut self, layout: DeckLayout) {
+        if self.deck_layout == layout {
+            return;
+        }
+        self.deck_layout = layout;
+        if !layout.contains(self.active) {
+            self.active = layout.order()[0];
+        }
+        for (deck, reference) in self.synced.iter_mut().enumerate() {
+            if !layout.contains(deck) || reference.is_some_and(|index| !layout.contains(index)) {
+                *reference = None;
+            }
+        }
+        self.audio_dirty = true;
+    }
+
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.add(egui::Image::new((self.logo.id(), Vec2::new(120.0, 40.0))).alt_text("RustDJ"));
             ui.label(
-                RichText::new(concat!(env!("CARGO_PKG_VERSION"), " / 4 DECKS"))
+                RichText::new(env!("CARGO_PKG_VERSION"))
                     .size(10.0)
                     .color(MUTED),
             );
             ui.separator();
+            let hidden_decks_playing = self
+                .decks
+                .iter()
+                .enumerate()
+                .any(|(index, deck)| !DeckLayout::Two.contains(index) && deck.playing());
+            if ui
+                .add_enabled(
+                    !hidden_decks_playing,
+                    egui::Button::new("2 Decks").selected(self.deck_layout == DeckLayout::Two),
+                )
+                .on_disabled_hover_text("Pause Decks 3 and 4 before switching to 2 Decks.")
+                .clicked()
+            {
+                self.set_deck_layout(DeckLayout::Two);
+            }
+            if ui
+                .selectable_label(self.deck_layout == DeckLayout::Four, "4 Decks")
+                .clicked()
+            {
+                self.set_deck_layout(DeckLayout::Four);
+            }
+            if ui
+                .selectable_label(self.library_view, "Library")
+                .on_hover_text("Expand the music browser. Click again to show the decks and mixer.")
+                .clicked()
+            {
+                self.library_view = !self.library_view;
+            }
+            if ui.button("Jingles").clicked() {
+                self.show_jingles = true;
+            }
+            if ui.button("History").clicked() {
+                self.show_history = true;
+                self.history_refresh = Instant::now();
+            }
+            if ui.add(egui::Button::new("Talkover").selected(self.talkover_settings.enabled)).clicked() {
+                self.show_performance = true;
+            }
+            ui.separator();
             let midi =
                 controller_status(self.midi.connected.as_deref(), self.midi.prefs.auto_connect);
             ui.add_sized(
-                [(ui.available_width() - 280.0).max(90.0), 24.0],
+                [(ui.available_width() - 390.0).max(90.0), 24.0],
                 egui::Label::new(RichText::new(&midi).size(12.0).strong().color(
                     if self.midi.connected.is_some() {
                         PURPLE
@@ -262,6 +459,16 @@ impl RustDj {
                     self.show_audio = true;
                     self.refresh_audio_devices(ctx);
                 }
+                let inputs_active = self.live_inputs[..AUX_INPUT_COUNT].iter().filter(|input| input.is_some()).count();
+                let label = if inputs_active == 0 {
+                    "Audio Inputs".into()
+                } else {
+                    format!("Audio Inputs · {inputs_active}/2")
+                };
+                if ui.add(egui::Button::new(label).selected(inputs_active != 0 || self.live_inputs[MIC].is_some())).clicked() {
+                    self.show_inputs = true;
+                    self.refresh_input_devices(ctx);
+                }
                 if ui.button("Controller / MIDI").clicked() {
                     self.show_midi = true;
                 }
@@ -276,7 +483,7 @@ impl RustDj {
                     .master
                     .device
                     .as_deref()
-                    .unwrap_or("Windows default")
+                    .unwrap_or("System default")
             };
             let master = format!(
                 "MASTER · {} · Channels {}/{}",
@@ -298,7 +505,7 @@ impl RustDj {
                             .phones_name
                             .as_deref()
                             .or(target.device.as_deref())
-                            .unwrap_or("Windows default");
+                            .unwrap_or("System default");
                         format!(
                             "PHONES · {name} · Channels {}/{}",
                             target.pair * 2 + 1,
@@ -317,6 +524,19 @@ impl RustDj {
                 self.show_audio = true;
                 self.refresh_audio_devices(ctx);
             }
+        });
+        ui.separator();
+        ui.columns(2, |columns| {
+            columns[0].horizontal(|ui| {
+                self.stream_control_ui(ui);
+                let status = &self.broadcaster.stream_status;
+                broadcast_status_ui(ui, "STREAM", status, "LIVE", PURPLE);
+            });
+            columns[1].horizontal(|ui| {
+                self.recording_control_ui(ui);
+                let status = &self.broadcaster.recording_status;
+                broadcast_status_ui(ui, "REC", status, "RECORDING", LIGHT_PURPLE);
+            });
         });
     }
 
@@ -345,7 +565,7 @@ impl RustDj {
                     ui.label(RichText::new("Drag tracks here from the browser.").color(MUTED));
                     ui.label(
                         RichText::new(
-                            "Select music on the left and load it into Deck 1, 3, 4 or 2.",
+                            "Select music on the left and load it into a deck.",
                         )
                         .small()
                         .color(MUTED),
@@ -357,7 +577,7 @@ impl RustDj {
                     .filter(|t| t.title.to_lowercase().contains(&query))
                 {
                     ui.horizontal(|ui| {
-                        for index in ORDER {
+                        for &index in self.deck_layout.order() {
                             if ui
                                 .small_button(
                                     RichText::new((index + 1).to_string()).color(deck_color(index)),
@@ -410,8 +630,14 @@ impl RustDj {
 impl RustDj {
     fn mix_gains(&self) -> crate::dsp::BusGains<COUNT> {
         bus_gains_with_crossfader(
-            self.decks.each_ref().map(|d| d.volume),
-            self.decks.each_ref().map(|d| d.pfl),
+            std::array::from_fn(|deck| {
+                if self.deck_layout.contains(deck) {
+                    self.decks[deck].volume * self.talkover.gain()
+                } else {
+                    0.0
+                }
+            }),
+            std::array::from_fn(|deck| self.deck_layout.contains(deck) && self.decks[deck].pfl),
             self.crossfader.position,
             self.master,
             self.phones,
@@ -425,8 +651,9 @@ impl RustDj {
             self.synced[follower] = None;
             return;
         }
-        let loaded =
-            std::array::from_fn(|i| self.decks[i].track.is_some() && self.synced[i].is_none());
+        let loaded = std::array::from_fn(|i| {
+            self.deck_layout.contains(i) && self.decks[i].track.is_some() && self.synced[i].is_none()
+        });
         let playing = self.decks.each_ref().map(|d| d.playing());
         let Some(master) =
             crate::decks::sync_reference(follower, loaded, playing, self.mix_gains().master)
@@ -530,7 +757,6 @@ impl RustDj {
     fn midi_actions(&mut self, ctx: &egui::Context) {
         let mut jogs = [0.0; COUNT];
         for (action, value) in self.midi.poll() {
-            // Ignore out-of-range deck IDs in user-edited mapping files.
             let deck = match action {
                 Action::SelectDeck(d)
                 | Action::Play(d)
@@ -563,7 +789,7 @@ impl RustDj {
                 | Action::LoopDouble(d) => Some(d),
                 _ => None,
             };
-            if deck.is_some_and(|d| d >= COUNT) {
+            if deck.is_some_and(|d| !self.deck_layout.contains(d)) {
                 continue;
             }
             if let Action::Jog(d) = action {
@@ -652,6 +878,8 @@ impl RustDj {
                 Action::Browse => {
                     self.browser.step_selection(value.clamp(-8.0, 8.0) as i32);
                 }
+                Action::Jingle(pad) if value > 0.0 => self.play_jingle(pad),
+                Action::Jingle(_) => {}
                 Action::Open => {
                     if let Some(BrowserEvent::Load(d, path)) =
                         self.browser.activate(self.active, ctx)
@@ -782,6 +1010,244 @@ impl RustDj {
         }
     }
 
+    fn stream_control_ui(&mut self, ui: &mut egui::Ui) {
+        if self.broadcaster.stream_busy() {
+            let stopping = self.broadcaster.stream_status.phase == Phase::Stopping;
+            if ui.add_enabled(!stopping, egui::Button::new("Stop stream")).clicked() {
+                self.broadcaster.stop_stream();
+                self.broadcaster.poll();
+            }
+            return;
+        }
+
+        let label = match self.stream_settings.security {
+            ConnectionSecurity::Tls => "Start TLS stream",
+            ConnectionSecurity::Plaintext => "Start unencrypted stream",
+        };
+        let button = egui::Button::new(label).fill(PURPLE.gamma_multiply(0.5));
+        let master_ready = self.audio.stream.is_some();
+        let keyring_ready = self.keyring_ready();
+        let disabled_hint = if keyring_ready {
+            "Select an available master output under Audio / Outputs first."
+        } else {
+            "Waiting for the system keyring."
+        };
+        if ui
+            .add_enabled(master_ready && keyring_ready, button)
+            .on_disabled_hover_text(disabled_hint)
+            .on_hover_text(format!("Stream profile: {}", self.stream_profiles[self.active_stream_profile].name))
+            .clicked()
+            && let Err(message) = self.broadcaster.start_stream(
+                self.audio.capture.clone(),
+                self.stream_settings.clone(),
+                self.stream_password.clone(),
+            )
+        {
+            self.broadcaster.stream_status = Status {
+                phase: Phase::Error,
+                message,
+                ..Status::default()
+            };
+        }
+    }
+
+    fn recording_control_ui(&mut self, ui: &mut egui::Ui) {
+        if self.broadcaster.recording_busy() {
+            let stopping = self.broadcaster.recording_status.phase == Phase::Stopping;
+            if ui
+                .add_enabled(!stopping, egui::Button::new("Stop recording"))
+                .clicked()
+            {
+                self.broadcaster.stop_recording();
+                self.broadcaster.poll();
+            }
+            return;
+        }
+
+        if ui
+            .add_enabled(
+                self.audio.stream.is_some(),
+                egui::Button::new("Start MP3 recording"),
+            )
+            .on_disabled_hover_text("Select an available master output under Audio / Outputs first.")
+            .clicked()
+            && let Err(message) = self
+                .broadcaster
+                .start_recording(self.audio.capture.clone(), &self.stream_settings)
+        {
+            self.broadcaster.recording_status = Status {
+                phase: Phase::Error,
+                message,
+                ..Status::default()
+            };
+        }
+    }
+
+    fn keyring_ready(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.keyring_task.is_none();
+
+        #[cfg(not(target_os = "linux"))]
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_keyring(&mut self) {
+        let Some(task) = &self.keyring_task else {
+            return;
+        };
+        let result = match task.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("The keyring operation stopped unexpectedly.".into())
+            }
+        };
+        self.keyring_task = None;
+        self.stream_password_error = None;
+        self.keyring_notice = match result {
+            Ok(KeyringUpdate::Loaded(password)) => {
+                self.stream_password = password;
+                if self.stream_password.is_empty() {
+                    None
+                } else {
+                    Some("Password loaded from the system keyring.")
+                }
+            }
+            Ok(KeyringUpdate::Saved) => Some("Password saved in the system keyring."),
+            Ok(KeyringUpdate::ProfileDeleted) => {
+                self.delete_stream_profile();
+                return;
+            }
+            Ok(KeyringUpdate::Removed) => {
+                self.stream_password.clear();
+                Some("Saved password removed from the system keyring.")
+            }
+            Err(error) => {
+                self.stream_password_error = Some(error);
+                None
+            }
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    fn keyring_controls_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.keyring_ready() {
+            ui.label("Waiting for the system keyring …");
+            return;
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.stream_password.is_empty(), egui::Button::new("Save password"))
+                .clicked()
+            {
+                self.keyring_task = Some(KeyringRequest::Save(self.stream_password.clone()).spawn(self.stream_profile_id()));
+            }
+            if ui.button("Remove saved password").clicked() {
+                self.keyring_task = Some(KeyringRequest::Remove.spawn(self.stream_profile_id()));
+            }
+            if self.stream_password_error.is_some() && ui.button("Reload saved password").clicked() {
+                self.keyring_task = Some(KeyringRequest::Load.spawn(self.stream_profile_id()));
+            }
+        });
+        if let Some(notice) = self.keyring_notice {
+            ui.label(notice);
+        }
+    }
+
+    fn stream_profile_id(&self) -> u64 {
+        self.stream_profiles[self.active_stream_profile].id
+    }
+
+    fn select_stream_profile(&mut self, index: usize) {
+        if index == self.active_stream_profile {
+            return;
+        }
+        self.stream_profiles[self.active_stream_profile].settings = self.stream_settings.clone();
+        self.restore_stream_profile(index);
+    }
+
+    fn restore_stream_profile(&mut self, index: usize) {
+        self.active_stream_profile = index;
+        let recording_dir = self.stream_settings.recording_dir.clone();
+        self.stream_settings = self.stream_profiles[index].settings.clone();
+        self.stream_settings.recording_dir = recording_dir;
+        self.stream_password.clear();
+        self.stream_password_error = None;
+        self.broadcaster.stream_status = Status::default();
+        self.confirm_profile_delete = false;
+        self.audio_dirty = true;
+        #[cfg(target_os = "linux")]
+        {
+            self.keyring_notice = None;
+            self.keyring_task = Some(KeyringRequest::Load.spawn(self.stream_profile_id()));
+        }
+        #[cfg(not(target_os = "linux"))]
+        match crate::credentials::unprotect(&self.stream_settings.protected_password) {
+            Ok(password) => self.stream_password = password,
+            Err(error) => self.stream_password_error = Some(error),
+        }
+    }
+
+    fn delete_stream_profile(&mut self) {
+        self.stream_profiles.remove(self.active_stream_profile);
+        let index = self.active_stream_profile.min(self.stream_profiles.len() - 1);
+        self.restore_stream_profile(index);
+    }
+
+    fn stream_profile_ui(&mut self, ui: &mut egui::Ui) {
+        let mut index = self.active_stream_profile;
+        ui.horizontal(|ui| {
+            ui.label("Stream profile");
+            egui::ComboBox::from_id_salt("stream-profile")
+                .selected_text(&self.stream_profiles[index].name)
+                .show_ui(ui, |ui| {
+                    for (item, profile) in self.stream_profiles.iter().enumerate() {
+                        ui.selectable_value(&mut index, item, &profile.name);
+                    }
+                });
+            if ui.button("New profile").clicked()
+                && let Some(id) = self.stream_profile_serial.checked_add(1)
+            {
+                self.stream_profile_serial = id;
+                self.stream_profiles.push(StreamProfile {
+                    id,
+                    name: format!("Stream {id}"),
+                    settings: StreamSettings::default(),
+                });
+                index = self.stream_profiles.len() - 1;
+            }
+            if ui.add_enabled(self.stream_profiles.len() > 1, egui::Button::new("Delete profile")).clicked() {
+                self.confirm_profile_delete = true;
+            }
+        });
+        self.select_stream_profile(index);
+        let profile = &mut self.stream_profiles[self.active_stream_profile];
+        ui.horizontal(|ui| {
+            ui.label("Profile name");
+            if ui.text_edit_singleline(&mut profile.name).changed() {
+                self.audio_dirty = true;
+            }
+        });
+        if self.confirm_profile_delete {
+            ui.horizontal(|ui| {
+                ui.label("Delete this profile and its saved password?");
+                if ui.button("Delete").clicked() {
+                    self.confirm_profile_delete = false;
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.keyring_task = Some(KeyringRequest::DeleteProfile.spawn(self.stream_profile_id()));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    self.delete_stream_profile();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_profile_delete = false;
+                }
+            });
+        }
+    }
+
     fn streamer_ui(&mut self, ctx: &egui::Context) {
         let mut open = self.show_streamer;
         let before = self.stream_settings.clone();
@@ -798,6 +1264,7 @@ impl RustDj {
                 ui.label("Only the master is streamed and recorded, including master level, EQ, filters and effects.");
                 ui.label(RichText::new(format!("Source: {} · Stereo · MP3 44.1 kHz", self.audio.master_name)).small().color(MUTED));
                 ui.separator();
+                ui.add_enabled_ui(!stream_busy && self.keyring_ready(), |ui| self.stream_profile_ui(ui));
                 ui.add_enabled_ui(!stream_busy, |ui| {
                     ui.spacing_mut().text_edit_width = 360.0;
                     egui::Grid::new("shoutcast-config").num_columns(2).spacing([14.0, 7.0]).show(ui, |ui| {
@@ -810,11 +1277,27 @@ impl RustDj {
                         ui.label("Source port"); ui.add(egui::DragValue::new(&mut self.stream_settings.source_port).range(1..=u16::MAX)); ui.end_row();
                         ui.label("Metadata/admin port"); ui.add(egui::DragValue::new(&mut self.stream_settings.admin_port).range(1..=u16::MAX)); ui.end_row();
                         ui.label("Stream ID (DNAS 2)"); ui.add(egui::DragValue::new(&mut self.stream_settings.stream_id).range(1..=u32::MAX)); ui.end_row();
-                        ui.label("Source password"); password_changed = ui.add(egui::TextEdit::singleline(&mut self.stream_password).password(true)).on_hover_text("Saved using Windows encryption for your user account and restored on the next startup.").changed(); ui.end_row();
+                        ui.label("Source password");
+                        password_changed = ui.add_enabled(
+                            self.keyring_ready(),
+                            egui::TextEdit::singleline(&mut self.stream_password).password(true),
+                        ).on_hover_text(crate::credentials::PASSWORD_HINT).changed();
+                        ui.end_row();
                         ui.label("Station name"); ui.text_edit_singleline(&mut self.stream_settings.station); ui.end_row();
                         ui.label("Genre (optional)"); ui.text_edit_singleline(&mut self.stream_settings.genre); ui.end_row();
                         ui.label("Station URL (optional)"); ui.text_edit_singleline(&mut self.stream_settings.url); ui.end_row();
                     });
+                    #[cfg(target_os = "linux")]
+                    {
+                        if password_changed {
+                            self.keyring_notice = None;
+                        }
+                        self.keyring_controls_ui(ui);
+                    }
+                });
+                ui.add_enabled_ui(!stream_busy, |ui| {
+                    ui.checkbox(&mut self.stream_settings.reconnect, "Reconnect after a connection drop")
+                        .on_hover_text("Retries a lost live connection up to five times.");
                 });
                 if self.stream_settings.security == ConnectionSecurity::Plaintext {
                     ui.colored_label(WARNING, "UNENCRYPTED: the source password and metadata password are exposed on the network. Use only on a trusted local or separately encrypted connection.");
@@ -838,11 +1321,7 @@ impl RustDj {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if stream_busy {
-                        if ui.button("Stop stream").clicked() { self.broadcaster.stop_stream(); }
-                    } else if ui.add_enabled(master_ready, egui::Button::new(if self.stream_settings.security == ConnectionSecurity::Tls { "Start TLS stream" } else { "Start unencrypted stream" }).fill(PURPLE.gamma_multiply(0.5))).clicked()
-                        && let Err(error) = self.broadcaster.start_stream(self.audio.capture.clone(), self.stream_settings.clone(), self.stream_password.clone())
-                    { self.broadcaster.stream_status.phase = Phase::Error; self.broadcaster.stream_status.message = error; }
+                    self.stream_control_ui(ui);
                     let status = &self.broadcaster.stream_status;
                     ui.label(RichText::new(format!("STREAM · {} · {:.2} MB", status.label(), status.bytes as f64 / 1_000_000.0)).color(if status.phase == Phase::Error { WARNING } else { PURPLE }));
                 });
@@ -861,11 +1340,7 @@ impl RustDj {
                     });
                 });
                 ui.horizontal(|ui| {
-                    if recording_busy {
-                        if ui.button("Stop recording").clicked() { self.broadcaster.stop_recording(); }
-                    } else if ui.add_enabled(master_ready, egui::Button::new("Start MP3 recording")).clicked()
-                        && let Err(error) = self.broadcaster.start_recording(self.audio.capture.clone(), &self.stream_settings)
-                    { self.broadcaster.recording_status.phase = Phase::Error; self.broadcaster.recording_status.message = error; }
+                    self.recording_control_ui(ui);
                     let status = &self.broadcaster.recording_status;
                     ui.label(RichText::new(format!("REC · {} · {} · {:.2} MB", status.label(), clock(Duration::from_secs_f64(status.seconds)), status.bytes as f64 / 1_000_000.0)).color(if status.phase == Phase::Error { WARNING } else { LIGHT_PURPLE }));
                 });
@@ -875,7 +1350,7 @@ impl RustDj {
                 if !master_ready { ui.colored_label(WARNING, "Select an available master output under Audio / Outputs first."); }
             });
         self.show_streamer = open;
-        if password_changed {
+        if password_changed && cfg!(windows) {
             match crate::credentials::protect(&self.stream_password) {
                 Ok(blob) => {
                     self.stream_settings.protected_password = blob;
@@ -889,6 +1364,160 @@ impl RustDj {
         }
     }
 
+    fn refresh_input_devices(&mut self, ctx: &egui::Context) {
+        if self.input_scan.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(inputs::devices());
+            ctx.request_repaint();
+        });
+        self.input_scan = Some(receiver);
+        self.input_scan_error = None;
+    }
+
+    fn start_input(&mut self, index: usize) {
+        self.input_errors[index] = match LiveInput::open(&self.input_settings[index], &self.audio) {
+            Ok(input) => {
+                self.live_inputs[index] = Some(input);
+                None
+            }
+            Err(error) => Some(error),
+        };
+    }
+
+    fn stop_input(&mut self, index: usize) {
+        self.live_inputs[index] = None;
+        if index == MIC {
+            self.mic_peak = 0.0;
+        }
+    }
+
+    fn update_inputs(&mut self, meter_decay: f32) {
+        self.mic_peak *= meter_decay;
+        let mic_peak = self.live_inputs[MIC].as_ref()
+            .filter(|input| !input.disconnected())
+            .map(|input| input.take_peak() * self.input_settings[MIC].level.clamp(0.0, 1.0));
+        self.mic_peak = self.mic_peak.max(mic_peak.unwrap_or(0.0));
+        self.talkover.update(self.talkover_settings, mic_peak, Instant::now());
+        for (index, live) in self.live_inputs.iter_mut().enumerate() {
+            let Some(input) = live else { continue };
+            if input.disconnected() {
+                *live = None;
+                if index == MIC {
+                    self.mic_peak = 0.0;
+                }
+                self.input_errors[index] = Some("Audio input disconnected. Reconnect it and enable the input again.".into());
+                continue;
+            }
+            let mut gain = self.input_settings[index].level.clamp(0.0, 1.0);
+            if index != MIC {
+                gain *= self.talkover.gain();
+            }
+            input.set_gain(gain * self.master, gain * self.phones * self.mixing);
+        }
+    }
+
+    fn inputs_ui(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.input_scan {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.input_scan = None;
+                    match result {
+                        Ok(devices) => self.input_devices = devices,
+                        Err(error) => self.input_scan_error = Some(error),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.input_scan = None;
+                    self.input_scan_error = Some("Could not list audio inputs.".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let mut open = self.show_inputs;
+        egui::Window::new("Audio Inputs").open(&mut open).default_width(570.0).max_height(ctx.content_rect().height() - 70.0).vscroll(true).show(ctx, |ui| {
+            ui.label("Enabled inputs feed the master, stream and recording.");
+            ui.horizontal(|ui| {
+                if ui.button("Refresh devices").clicked() {
+                    self.refresh_input_devices(ctx);
+                }
+                if self.input_scan.is_some() {
+                    ui.spinner();
+                }
+            });
+            if let Some(error) = &self.input_scan_error {
+                ui.colored_label(WARNING, error);
+            }
+            for index in 0..self.input_settings.len() {
+                ui.separator();
+                ui.push_id(index, |ui| {
+                    let active = self.live_inputs[index].is_some();
+                    ui.horizontal(|ui| {
+                        if index == MIC {
+                            ui.strong("Microphone");
+                        } else {
+                            ui.strong(format!("Input {}", index + 1));
+                        }
+                        if active {
+                            if ui.button("Disable input").clicked() {
+                                self.stop_input(index);
+                            } else if let Some(input) = &self.live_inputs[index] {
+                                let peak = if index == MIC { self.mic_peak } else { input.take_peak() };
+                                ui.label(format!("ACTIVE · {}", peak_text(peak)));
+                            }
+                        } else if ui.button("Enable input").clicked() {
+                            self.start_input(index);
+                        }
+                    });
+                    let settings = &mut self.input_settings[index];
+                    let original_device = settings.device.clone();
+                    ui.add_enabled_ui(!active, |ui| {
+                        egui::ComboBox::from_id_salt("device")
+                            .width(ui.available_width().min(510.0))
+                            .selected_text(settings.device.as_deref().unwrap_or("System default input"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.device, None, "System default input");
+                                for device in &self.input_devices {
+                                    ui.selectable_value(&mut settings.device, Some(device.name.clone()), &device.name);
+                                }
+                            });
+                        if original_device != settings.device {
+                            settings.channel = 0;
+                            self.audio_dirty = true;
+                        }
+                        let channels = self.input_devices.iter()
+                            .find(|device| Some(device.name.as_str()) == settings.device.as_deref())
+                            .map_or(32, |device| device.channels);
+                        ui.horizontal(|ui| {
+                            let mut stereo = settings.stereo;
+                            if ui.add_enabled(channels > 1 || stereo, egui::Checkbox::new(&mut stereo, "Stereo pair")).changed() {
+                                settings.stereo = stereo;
+                                self.audio_dirty = true;
+                            }
+                            let max_first = channels.saturating_sub(u16::from(settings.stereo)).max(1);
+                            let mut channel = settings.channel.saturating_add(1);
+                            ui.label(if settings.stereo { "First channel" } else { "Channel" });
+                            if ui.add(egui::DragValue::new(&mut channel).range(1..=max_first)).changed() {
+                                settings.channel = channel - 1;
+                                self.audio_dirty = true;
+                            }
+                        });
+                    });
+                    if ui.add(egui::Slider::new(&mut settings.level, 0.0..=1.0).text("Input level")).changed() {
+                        self.audio_dirty = true;
+                    }
+                    if let Some(error) = &self.input_errors[index] {
+                        ui.colored_label(WARNING, error);
+                    }
+                });
+            }
+        });
+        self.show_inputs = open;
+    }
+
     fn refresh_audio_devices(&mut self, ctx: &egui::Context) {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
@@ -899,6 +1528,367 @@ impl RustDj {
         self.device_scan = Some(receiver);
     }
 
+    fn play_jingle(&mut self, pad: usize) {
+        if let Err(error) = self.jingles.play(pad, &self.audio, self.master) {
+            self.notice = Some(error);
+        }
+    }
+
+    fn jingles_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_jingles {
+            return;
+        }
+        let mut open = self.show_jingles;
+        egui::Window::new("Jingles")
+            .open(&mut open)
+            .default_width(495.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.jingles.settings.level, 0.0..=1.0)
+                                .text("Jingle level"),
+                        )
+                        .changed()
+                    {
+                        self.audio_dirty = true;
+                    }
+                    if ui.button("Stop all").clicked() {
+                        self.jingles.stop_all();
+                    }
+                });
+                for pad in 0..jingles::COUNT {
+                    ui.push_id(pad, |ui| {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let file = self.jingles.settings.paths[pad].as_deref();
+                            let label = file
+                                .and_then(|path| path.file_stem())
+                                .map(|name| name.to_string_lossy().into_owned());
+                            if ui
+                                .add_enabled(
+                                    file.is_some(),
+                                    egui::Button::new(format!("Play {}", pad + 1))
+                                        .selected(self.jingles.playing(pad)),
+                                )
+                                .clicked()
+                            {
+                                self.play_jingle(pad);
+                            }
+                            if ui
+                                .add_enabled(self.jingles.playing(pad), egui::Button::new("Stop"))
+                                .clicked()
+                            {
+                                self.jingles.stop(pad);
+                            }
+                            if ui.button("Choose file …").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Audio", track::EXTENSIONS)
+                                    .pick_file()
+                            {
+                                self.jingles.stop(pad);
+                                self.jingles.settings.paths[pad] = Some(path);
+                                self.audio_dirty = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.jingles.settings.paths[pad].is_some(),
+                                    egui::Button::new("Clear"),
+                                )
+                                .clicked()
+                            {
+                                self.jingles.stop(pad);
+                                self.jingles.settings.paths[pad] = None;
+                                self.audio_dirty = true;
+                            }
+                            ui.add(
+                                egui::Label::new(label.as_deref().unwrap_or("Empty pad"))
+                                    .truncate(),
+                            );
+                        });
+                    });
+                }
+            });
+        self.show_jingles = open;
+    }
+
+    fn talkover_ui(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Talkover")
+            .open(&mut self.show_performance)
+            .default_width(385.0)
+            .show(ctx, |ui| {
+                let settings = &mut self.talkover_settings;
+                self.audio_dirty |= ui
+                    .checkbox(&mut settings.enabled, "Lower music while speaking")
+                    .changed();
+                ui.add_enabled_ui(settings.enabled, |ui| {
+                    self.audio_dirty |= ui
+                        .add(
+                            egui::Slider::new(&mut settings.threshold_db, -60.0..=-10.0)
+                                .text("Mic threshold")
+                                .suffix(" dBFS"),
+                        )
+                        .changed();
+                    self.audio_dirty |= ui
+                        .add(
+                            egui::Slider::new(&mut settings.reduction_db, 3.0..=24.0)
+                                .text("Music reduction")
+                                .suffix(" dB"),
+                        )
+                        .changed();
+                    self.audio_dirty |= ui
+                        .add(
+                            egui::Slider::new(&mut settings.release_ms, 80..=2000)
+                                .text("Return time")
+                                .suffix(" ms"),
+                        )
+                        .changed();
+                });
+                if settings.enabled && self.talkover.gain() < 0.99 {
+                    ui.colored_label(
+                        LIGHT_PURPLE,
+                        format!("Talkover · {:.1} dB", peak_db(self.talkover.gain())),
+                    );
+                }
+            });
+    }
+
+    fn log_audible_tracks(&mut self, gains: &crate::dsp::BusGains<COUNT>, now: Instant) {
+        for (index, deck) in self.decks.iter().enumerate() {
+            if self.history_logged[index] {
+                continue;
+            }
+            if !deck.program_playing() || gains.master[index] < 0.001 {
+                self.audible_since[index] = None;
+                continue;
+            }
+            let started = *self.audible_since[index].get_or_insert(now);
+            let elapsed = now.saturating_duration_since(started);
+            if elapsed >= Duration::from_secs(2)
+                && let Some(track) = &deck.track
+            {
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .saturating_sub(elapsed)
+                    .as_secs() as i64;
+                self.hotcue_store.play(
+                    track.title.clone(),
+                    track.path.clone(),
+                    index + 1,
+                    timestamp,
+                );
+                self.history_logged[index] = true;
+            }
+        }
+    }
+
+    fn history_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_history {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.history_refresh {
+            self.history_refresh = now + Duration::from_secs(2);
+            match Database::open(&database::default_path()).and_then(|db| db.history(500)) {
+                Ok(entries) => self.history = entries,
+                Err(error) => self.notice = Some(error),
+            }
+        }
+        egui::Window::new("Set history")
+            .open(&mut self.show_history)
+            .default_width(580.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Export CSV …").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("RustDJ-set-history.csv")
+                            .add_filter("CSV", &["csv"])
+                            .save_file()
+                    {
+                        self.notice = Some(match export_history(&path) {
+                            Ok(()) => format!("Set history saved to {}", path.display()),
+                            Err(error) => error,
+                        });
+                    }
+                    ui.label("Last 500 plays");
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(410.0).show_rows(
+                    ui,
+                    19.0,
+                    self.history.len(),
+                    |ui, rows| {
+                        for entry in &self.history[rows] {
+                            ui.horizontal(|ui| {
+                                ui.monospace(&entry.local_time);
+                                ui.label(format!("Deck {}", entry.deck));
+                                ui.add(egui::Label::new(&entry.title).truncate())
+                                    .on_hover_text(&entry.path);
+                            });
+                        }
+                    },
+                );
+                if self.history.is_empty() {
+                    ui.label("Tracks appear after two seconds in the master mix.");
+                }
+            });
+    }
+
+    fn open_grid_editor(&mut self, index: usize) {
+        let deck = &self.decks[index];
+        if let Some(track) = &deck.track {
+            let mut grid = deck.grid.unwrap_or(BeatGrid {
+                bpm: 120.0,
+                offset: 0.0,
+                confidence: 1.0,
+            });
+            grid.bpm = grid.bpm.clamp(40.0, 250.0);
+            self.grid_editor = Some(GridEditor {
+                deck: index,
+                path: track.path.clone(),
+                grid,
+                error: None,
+            });
+        }
+    }
+
+    fn grid_editor_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.grid_editor.take() else {
+            return;
+        };
+        let deck = &mut self.decks[editor.deck];
+        let Some(track) = deck
+            .track
+            .as_ref()
+            .filter(|track| track.path == editor.path)
+        else {
+            return;
+        };
+        let duration = track.duration.as_secs_f64();
+        let last = (duration - 0.001).max(0.0);
+        let title = track.title.clone();
+        let mut open = true;
+        let mut apply = None;
+        egui::Window::new("Beatgrid editor")
+            .open(&mut open)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.heading(format!("Deck {} · {title}", editor.deck + 1));
+                let position = deck.position().as_secs_f64();
+                ui.label(format!("Playhead {}", clock(deck.position())));
+                ui.horizontal(|ui| {
+                    ui.label("Tempo");
+                    ui.add(
+                        egui::DragValue::new(&mut editor.grid.bpm)
+                            .range(40.0..=250.0)
+                            .speed(0.01)
+                            .fixed_decimals(2)
+                            .suffix(" BPM"),
+                    );
+                    ui.label("First beat");
+                    ui.add(
+                        egui::DragValue::new(&mut editor.grid.offset)
+                            .range(0.0..=last)
+                            .speed(0.001)
+                            .fixed_decimals(3)
+                            .suffix(" s"),
+                    );
+                });
+                if !editor.grid.bpm.is_finite() {
+                    editor.grid.bpm = 120.0;
+                }
+                if !editor.grid.offset.is_finite() {
+                    editor.grid.offset = 0.0;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Set from playhead").clicked() {
+                        editor.grid.offset = position.min(last);
+                    }
+                    if ui.button("−10 ms").clicked() {
+                        editor.grid.offset = (editor.grid.offset - 0.01).max(0.0);
+                    }
+                    if ui.button("+10 ms").clicked() {
+                        editor.grid.offset = (editor.grid.offset + 0.01).min(last);
+                    }
+                    if ui.button("Go to first beat").clicked() {
+                        deck.seek(Duration::from_secs_f64(editor.grid.offset), &self.audio);
+                    }
+                });
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+                let painter = ui.painter().with_clip_rect(rect);
+                painter.rect_filled(rect, 3.0, BG);
+                let first = editor.grid.offset;
+                let period = editor.grid.period();
+                let start = first - period;
+                let end = first + period * 3.0;
+                let middle = rect.left() + rect.width() * 0.25;
+                if let Some(track) = &deck.track {
+                    let step = (end - start) / rect.width().max(1.0) as f64;
+                    for column in 0..rect.width() as usize {
+                        let time = start + column as f64 * step;
+                        if let Some(frame) = track.detailed.sample(time, time + step) {
+                            spectral_column(
+                                &painter,
+                                rect,
+                                rect.left() + column as f32,
+                                frame,
+                                false,
+                            );
+                        }
+                    }
+                }
+                for beat in 0..4 {
+                    let x = rect.left() + rect.width() * beat as f32 * 0.25;
+                    painter.vline(
+                        x,
+                        rect.y_range(),
+                        Stroke::new(1.0_f32, if beat == 1 { LIGHT_PURPLE } else { BORDER }),
+                    );
+                }
+                painter.circle_filled(Pos2::new(middle, rect.top() + 4.0), 3.0, LIGHT_PURPLE);
+                ui.horizontal(|ui| {
+                    if ui.button("Save beatgrid").clicked() {
+                        apply = Some(Some(editor.grid));
+                    }
+                    if ui.button("Use detected grid").clicked() {
+                        apply = Some(None);
+                    }
+                });
+                if let Some(error) = &editor.error {
+                    ui.colored_label(WARNING, error);
+                }
+            });
+        if let Some(grid) = apply {
+            match deck.save_grid(grid) {
+                Ok(()) => {
+                    for (index, deck) in self.decks.iter_mut().enumerate() {
+                        if let Some(track) = deck
+                            .track
+                            .as_ref()
+                            .filter(|track| track.path == editor.path)
+                        {
+                            deck.grid = grid.or(track.grid);
+                            deck.exit_loop();
+                            self.synced[index] = None;
+                            for follower in &mut self.synced {
+                                if *follower == Some(index) {
+                                    *follower = None;
+                                }
+                            }
+                        }
+                    }
+                    self.notice = Some("Beatgrid updated.".into());
+                    open = false;
+                }
+                Err(error) => editor.error = Some(error),
+            }
+        }
+        if open {
+            self.grid_editor = Some(editor);
+        }
+    }
     fn apply_audio(&mut self, routing: Routing) {
         if self.broadcaster.busy() {
             self.notice =
@@ -908,6 +1898,8 @@ impl RustDj {
         match Audio::open(routing) {
             Ok(audio) => {
                 audio.master_eq.set(self.master_eq);
+                audio.limiter.set(self.master_limiter);
+                self.jingles.stop_all();
                 let mut errors = Vec::new();
                 for deck in &mut self.decks {
                     if let Err(error) = deck.rebind(&audio) {
@@ -917,6 +1909,11 @@ impl RustDj {
                     }
                 }
                 self.audio = audio;
+                for index in 0..self.live_inputs.len() {
+                    if self.live_inputs[index].take().is_some() {
+                        self.start_input(index);
+                    }
+                }
                 self.routing_edit = self.audio.routing.clone();
                 self.audio_dirty = true;
                 self.notice = Some(if errors.is_empty() {
@@ -994,9 +1991,9 @@ fn target_ui(ui: &mut egui::Ui, id: &str, target: &mut Target, devices: &[Device
     egui::ComboBox::from_id_salt(id)
         .width(ui.available_width().min(580.0))
         .wrap_mode(egui::TextWrapMode::Truncate)
-        .selected_text(target.device.as_deref().unwrap_or("Windows system default"))
+        .selected_text(target.device.as_deref().unwrap_or("System default"))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut target.device, None, "Windows system default");
+            ui.selectable_value(&mut target.device, None, "System default");
             for device in devices {
                 ui.selectable_value(
                     &mut target.device,
@@ -1024,7 +2021,7 @@ fn phones_device_ui(
     let old = choice.clone();
     let label = match &choice {
         None => "Off – no headphone output",
-        Some(None) => "Windows system default",
+        Some(None) => "System default",
         Some(Some(name)) => name,
     }
     .to_owned();
@@ -1035,7 +2032,7 @@ fn phones_device_ui(
         .selected_text(&label)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut choice, None, "Off – no headphone output");
-            ui.selectable_value(&mut choice, Some(None), "Windows system default");
+            ui.selectable_value(&mut choice, Some(None), "System default");
             for device in devices {
                 ui.selectable_value(
                     &mut choice,
@@ -1096,6 +2093,8 @@ impl eframe::App for RustDj {
             self.mixing,
             self.crossfader.enabled,
         );
+        self.limiter_reduction = (self.limiter_reduction * meter_decay)
+            .max(self.audio.limiter.take_reduction());
         let (master_peaks, phones_peaks) = self.audio.levels();
         for (bus, peaks) in [master_peaks, phones_peaks].into_iter().enumerate() {
             for (channel, value) in peaks.into_iter().enumerate() {
@@ -1108,6 +2107,8 @@ impl eframe::App for RustDj {
             self.notice = Some(error);
         }
         self.broadcaster.poll();
+        #[cfg(target_os = "linux")]
+        self.poll_keyring();
         self.browser.poll();
         self.midi.tick(ctx);
         for (index, deck) in self.decks.iter_mut().enumerate() {
@@ -1121,6 +2122,8 @@ impl eframe::App for RustDj {
                     }
                 }
                 self.taps[index].clear();
+                self.audible_since[index] = None;
+                self.history_logged[index] = false;
                 upsert_session(&mut self.library, Item::from_track(&track));
             }
         }
@@ -1131,61 +2134,70 @@ impl eframe::App for RustDj {
             .show(ctx, |ui| {
                 self.header(ui, ctx);
             });
+        let deck_order = self.deck_layout.order();
         egui::TopBottomPanel::bottom("footer").frame(egui::Frame::new().fill(PANEL).inner_margin(4.0)).show(ctx, |ui| {
             if let Some(error) = &self.audio.error {
                 ui.add(egui::Label::new(RichText::new(error).small().color(WARNING)).truncate()).on_hover_text(error);
             } else if let Some(notice) = &self.notice {
                 ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).truncate()).on_hover_text(notice);
             } else {
-                ui.label(RichText::new("1 / 2 / 3 / 4  Select deck     SPACE  Play/Pause     S  Sync     C  Cue     ESC  Stop     Left / Right  Crossfader").size(10.0).color(MUTED));
+                let keys = match self.deck_layout {
+                    DeckLayout::Two => "1 / 2",
+                    DeckLayout::Four => "1 / 2 / 3 / 4",
+                };
+                ui.label(RichText::new(format!("{keys}  Select deck     SPACE  Play/Pause     S  Sync     C  Cue     ESC  Stop     Left / Right  Crossfader")).size(10.0).color(MUTED));
             }
         });
-        egui::TopBottomPanel::top("waveforms")
-            .resizable(true)
-            .default_height(160.0)
-            .height_range(120.0..=260.0)
-            .frame(egui::Frame::new().fill(BG).inner_margin(5.0))
-            .show(ctx, |ui| {
-                self.waveforms_ui(ui);
-            });
+        if !self.library_view {
+            egui::TopBottomPanel::top("beat-waveforms")
+                .resizable(true)
+                .default_height(114.0)
+                .height_range(100.0..=180.0)
+                .frame(egui::Frame::new().fill(BG).inner_margin(5.0))
+                .show(ctx, |ui| {
+                    self.waveforms_ui(ui);
+                });
+        }
         let mut bounds = [Rect::NOTHING; COUNT];
         let mut drops = Zones::default();
         let mut responses = [DeckResponse::default(); COUNT];
-        egui::TopBottomPanel::top("console")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(5.0))
-            .show(ctx, |ui| {
-                let (mixer_width, deck_width) = console_dimensions(ui.available_width());
-                ui.horizontal_top(|ui| {
-                    for (slot, index) in ORDER.into_iter().enumerate() {
-                        if slot == 2 {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(mixer_width, 360.0),
+        if !self.library_view {
+            egui::TopBottomPanel::top("console")
+                .frame(egui::Frame::new().fill(PANEL).inner_margin(5.0))
+                .show(ctx, |ui| {
+                    let (mixer_width, deck_width) = console_dimensions(ui.available_width(), self.deck_layout);
+                    ui.horizontal_top(|ui| {
+                        for (slot, &index) in deck_order.iter().enumerate() {
+                            if slot == deck_order.len() / 2 {
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(mixer_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| self.mixer_ui(ui, mixer_width),
+                                );
+                            }
+                            let card = ui.allocate_ui_with_layout(
+                                Vec2::new(deck_width, 0.0),
                                 egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.mixer_ui(ui, mixer_width),
+                                |ui| {
+                                    responses[index] = deck_ui(
+                                        ui,
+                                        &mut self.decks[index],
+                                        &self.audio,
+                                        index,
+                                        self.active == index,
+                                        self.synced[index].is_some(),
+                                        deck_width,
+                                    )
+                                    .inner;
+                                },
                             );
+                            bounds[index] = card.response.rect;
+                            drops.add(DropTarget::Deck(index), card.response.rect, ui.layer_id());
                         }
-                        let card = ui.allocate_ui_with_layout(
-                            Vec2::new(deck_width, 320.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                responses[index] = deck_ui(
-                                    ui,
-                                    &mut self.decks[index],
-                                    &self.audio,
-                                    index,
-                                    self.active == index,
-                                    self.synced[index].is_some(),
-                                    deck_width,
-                                )
-                                .inner;
-                            },
-                        );
-                        bounds[index] = card.response.rect;
-                        drops.add(DropTarget::Deck(index), card.response.rect, ui.layer_id());
-                    }
+                    });
                 });
-            });
-        for index in 0..COUNT {
+        }
+        for &index in deck_order {
             if ctx.input(|i| {
                 i.pointer.any_pressed()
                     && i.pointer
@@ -1197,6 +2209,9 @@ impl eframe::App for RustDj {
             let response = responses[index];
             if response.open {
                 self.pick(index, ctx);
+            }
+            if response.edit_grid {
+                self.open_grid_editor(index);
             }
             if response.tempo_changed || response.performance_changed {
                 self.synced[index] = None;
@@ -1237,7 +2252,8 @@ impl eframe::App for RustDj {
                     ui.layer_id(),
                 );
                 if self.playlist_tab {
-                    if let Some((index, path)) = self.playlist.ui(ui, ctx, self.active, &mut drops)
+                    if let Some((index, path)) =
+                        self.playlist.ui(ui, ctx, self.active, deck_order, &mut drops)
                     {
                         self.decks[index].load(path, ctx.clone());
                         self.active = index;
@@ -1248,7 +2264,7 @@ impl eframe::App for RustDj {
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
-            .show(ctx, |ui| match self.browser.ui(ui, self.active, ctx) {
+            .show(ctx, |ui| match self.browser.ui(ui, self.active, deck_order, ctx) {
                 Some(BrowserEvent::Load(index, path)) => {
                     self.decks[index].load(path, ctx.clone());
                     self.active = index;
@@ -1261,6 +2277,13 @@ impl eframe::App for RustDj {
             });
         self.controller_ui(ctx);
         self.audio_ui(ctx);
+        self.inputs_ui(ctx);
+        self.update_inputs(meter_decay);
+        self.jingles_ui(ctx);
+        self.talkover_ui(ctx);
+        self.history_ui(ctx);
+        self.grid_editor_ui(ctx);
+        self.jingles.update(self.master);
         self.playlist.confirm_changes(ctx);
         if let Some((target, music)) = drops.finish(ctx) {
             match target {
@@ -1298,9 +2321,11 @@ impl eframe::App for RustDj {
         if !external_music.is_empty() {
             match external_target {
                 Some(DropTarget::Deck(index)) => {
-                    for (offset, path) in external_music.into_iter().take(COUNT).enumerate() {
-                        let slot = ORDER.iter().position(|d| *d == index).unwrap_or(0);
-                        let target = ORDER[(slot + offset) % COUNT];
+                    let slot = deck_order.iter().position(|&deck| deck == index).unwrap_or(0);
+                    for (offset, path) in
+                        external_music.into_iter().take(deck_order.len()).enumerate()
+                    {
+                        let target = deck_order[(slot + offset) % deck_order.len()];
                         self.decks[target].load(path, ctx.clone());
                         self.active = target;
                     }
@@ -1344,6 +2369,7 @@ impl eframe::App for RustDj {
                 self.hotcue_store.save(snapshot);
             }
         }
+        self.log_audible_tracks(&gains, now);
         let dominant = (0..COUNT)
             .filter(|i| self.decks[*i].playing() && gains.master[*i] > 0.0001)
             .max_by(|a, b| gains.master[*a].total_cmp(&gains.master[*b]));
@@ -1360,6 +2386,9 @@ impl eframe::App for RustDj {
         self.equalizer_ui(ctx);
         self.midi.feedback(
             std::array::from_fn(|index| {
+                if !self.deck_layout.contains(index) {
+                    return midi::DeckLeds::default();
+                }
                 let deck = &self.decks[index];
                 midi::DeckLeds {
                     effects: deck.fx_enabled,
@@ -1387,8 +2416,14 @@ impl eframe::App for RustDj {
                 )
         {
             self.midi.save_current_profile();
+            self.stream_profiles[self.active_stream_profile].settings = self.stream_settings.clone();
+            let mut legacy = self.stream_profiles.iter()
+                .find(|profile| profile.id == 0)
+                .map_or_else(StreamSettings::default, |profile| profile.settings.clone());
+            legacy.recording_dir = self.stream_settings.recording_dir.clone();
             let settings = Settings {
                 browser: self.browser.settings.clone(),
+                deck_layout: self.deck_layout,
                 bindings: Some(self.midi.bindings.clone()),
                 routing: self.audio.routing.clone(),
                 mix: MixSettings {
@@ -1399,7 +2434,15 @@ impl eframe::App for RustDj {
                 },
                 mapping_version: 7,
                 midi: self.midi.prefs.clone(),
-                streamer: self.stream_settings.clone(),
+                streamer: legacy,
+                stream_profiles: self.stream_profiles.clone(),
+                active_stream_profile: self.stream_profile_id(),
+                stream_profile_serial: self.stream_profile_serial,
+                inputs: [self.input_settings[0].clone(), self.input_settings[1].clone()],
+                microphone: self.input_settings[MIC].clone(),
+                talkover: self.talkover_settings,
+                master_limiter: self.master_limiter,
+                jingles: self.jingles.settings.clone(),
                 master_eq: self.master_eq,
             };
             if let Err(error) = settings::save(&settings) {
@@ -1435,6 +2478,74 @@ fn upsert_session(items: &mut Vec<Item>, item: Item) {
     }
 }
 
+fn export_history(path: &std::path::Path) -> Result<(), String> {
+    use std::io::{BufWriter, Write};
+
+    fn csv(value: &str) -> String {
+        let escaped = value.replace('"', r#""""#);
+        let prefix = if value.trim_start().starts_with(['=', '+', '-', '@']) {
+            "'"
+        } else {
+            ""
+        };
+        format!(r#""{prefix}{escaped}""#)
+    }
+
+    let entries = Database::open(&database::default_path())?.history(-1)?;
+    let mut file = BufWriter::new(std::fs::File::create(path).map_err(|error| error.to_string())?);
+    writeln!(file, "played_at_utc,title,deck,path").map_err(|error| error.to_string())?;
+    for entry in entries.iter().rev() {
+        writeln!(
+            file,
+            "{},{},{},{}",
+            entry.utc_time,
+            csv(&entry.title),
+            entry.deck,
+            csv(&entry.path)
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    file.flush().map_err(|error| error.to_string())
+}
+
+fn broadcast_status_ui(ui: &mut egui::Ui, name: &str, status: &Status, active: &str, color: Color32) {
+    let phase = if status.phase == Phase::Running {
+        active
+    } else {
+        status.label()
+    };
+    let mut text = format!("{name} · {phase}");
+    if status.seconds > 0.0 {
+        let total_seconds = status.seconds as u64;
+        let (minutes, seconds) = (total_seconds / 60, total_seconds % 60);
+        text.push_str(&format!(" · {minutes:02}:{seconds:02}"));
+    }
+    let color = match status.phase {
+        Phase::Error | Phase::Reconnecting => {
+            text.push_str(" · ");
+            text.push_str(&status.message);
+            WARNING
+        }
+        Phase::Idle | Phase::Done => MUTED,
+        _ => color,
+    };
+    let response = ui.add(egui::Label::new(RichText::new(&text).strong().color(color)).truncate());
+    let mut details = text;
+    if !matches!(status.phase, Phase::Error | Phase::Reconnecting) && !status.message.is_empty() {
+        details.push('\n');
+        details.push_str(&status.message);
+    }
+    if let Some(path) = &status.path {
+        details.push('\n');
+        details.push_str(&path.to_string_lossy());
+    }
+    if let Some(error) = &status.metadata_error {
+        details.push('\n');
+        details.push_str(error);
+    }
+    response.on_hover_text(details);
+}
+
 fn clock(time: Duration) -> String {
     let secs = time.as_secs();
     format!(
@@ -1449,6 +2560,7 @@ fn clock(time: Duration) -> String {
 struct DeckResponse {
     performance_changed: bool,
     open: bool,
+    edit_grid: bool,
     sync: bool,
     tap: bool,
     toggled: bool,
@@ -1558,6 +2670,10 @@ fn deck_ui(
                             offset: 0.0,
                             confidence: 0.0,
                         });
+                    }
+                    if ui.add_enabled(deck.track.is_some(), egui::Button::new("Beatgrid editor …")).clicked() {
+                        response.edit_grid = true;
+                        ui.close();
                     }
                     if ui.button("Tap BPM").clicked() {
                         response.tap = true;
@@ -1731,7 +2847,7 @@ fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
         ui.spacing_mut().button_padding = Vec2::new(4.0, 2.0);
         ui.label(RichText::new(label).size(9.0).color(MUTED));
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(38.0, 32.0), Sense::click_and_drag());
+            ui.allocate_exact_size(Vec2::new(28.0, 22.0), Sense::click_and_drag());
         if response.dragged() {
             *value = (*value - response.drag_delta().y * 0.2 + response.drag_delta().x * 0.1)
                 .clamp(-24.0, 12.0);
@@ -1747,13 +2863,13 @@ fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
             } else {
                 *value / 12.0
             } * 2.3;
-        ui.painter().circle_filled(center, 15.0, BG);
+        ui.painter().circle_filled(center, 10.0, BG);
         ui.painter()
-            .circle_stroke(center, 15.0, Stroke::new(1.0_f32, BORDER));
+            .circle_stroke(center, 10.0, Stroke::new(1.0_f32, BORDER));
         ui.painter().line_segment(
             [
-                center + Vec2::angled(angle) * 5.0,
-                center + Vec2::angled(angle) * 12.0,
+                center + Vec2::angled(angle) * 3.0,
+                center + Vec2::angled(angle) * 8.0,
             ],
             Stroke::new(2.0_f32, color),
         );
@@ -1762,7 +2878,7 @@ fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
                 .range(-24.0..=12.0)
                 .speed(0.2)
                 .fixed_decimals(1)
-                .suffix(" dB"),
+                ,
         );
     });
 }
@@ -1780,11 +2896,10 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
             knob_ui(&mut columns[1], "GAIN", &mut deck.gain, color);
             columns[1].vertical_centered(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
-                ui.label(RichText::new("LEVEL").size(8.0).color(MUTED));
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().slider_width = 100.0;
+                    ui.spacing_mut().slider_width = 64.0;
                     ui.add_sized(
-                        [18.0, 100.0],
+                        [18.0, 64.0],
                         egui::Slider::new(&mut deck.volume, 0.0..=1.0)
                             .vertical()
                             .show_value(false),
@@ -1803,7 +2918,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
                 {
                     deck.pfl = !deck.pfl;
                 }
-                if ui.small_button("Reset").clicked() {
+                if ui.small_button("↺").on_hover_text("Reset gain and EQ").clicked() {
                     deck.eq = [0.0; 3];
                     deck.gain = 0.0;
                 }
@@ -1813,7 +2928,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
 }
 
 fn strip_meter_ui(ui: &mut egui::Ui, level: f32, color: Color32) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, 100.0), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, 64.0), Sense::hover());
     response.on_hover_text(format!("Channel level: {}", peak_text(level)));
     let db = peak_db(level);
     for segment in 0..30 {
@@ -1987,11 +3102,61 @@ fn fx_knob(
 }
 
 impl RustDj {
+    fn mic_mixer_ui(&mut self, ui: &mut egui::Ui) {
+        let active = self.live_inputs[MIC].is_some();
+        let (text, color) = if self.input_errors[MIC].is_some() {
+            ("MIC ERR", WARNING)
+        } else if active {
+            ("MIC ON", LIGHT_PURPLE)
+        } else {
+            ("MIC OFF", MUTED)
+        };
+        let hint = self.input_errors[MIC]
+            .as_deref()
+            .unwrap_or("Toggle the microphone. Choose its device under Audio Inputs.");
+        if ui
+            .add_sized(
+                [62.0, 17.0],
+                egui::Button::new(RichText::new(text).color(color)).small().selected(active),
+            )
+            .on_hover_text(hint)
+            .clicked()
+        {
+            if active {
+                self.stop_input(MIC);
+            } else {
+                self.start_input(MIC);
+            }
+        }
+        ui.spacing_mut().slider_width = 54.0;
+        let level = &mut self.input_settings[MIC].level;
+        if ui
+            .add(egui::Slider::new(level, 0.0..=1.0).show_value(false))
+            .on_hover_text(format!("Microphone level: {:.0}%", *level * 100.0))
+            .changed()
+        {
+            self.audio_dirty = true;
+        }
+        let display = peak_text(self.mic_peak);
+        let fill = if self.mic_peak >= 1.0 { WARNING } else { LIGHT_PURPLE };
+        let visible = ((peak_db(self.mic_peak) + 60.0) / 60.0).clamp(0.0, 1.0);
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(42.0, 8.0), Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, BG);
+        if visible > 0.0 {
+            ui.painter().rect_filled(
+                Rect::from_min_size(rect.min, Vec2::new(rect.width() * visible, rect.height())),
+                2.0,
+                fill,
+            );
+        }
+        response.on_hover_text(format!("Microphone: {display}"));
+    }
+
     fn mixer_ui(&mut self, ui: &mut egui::Ui, width: f32) {
         let (mut apply_phones, mut refresh_devices, mut show_audio) = (false, false, false);
         card().show(ui, |ui| {
             ui.set_width(width - 18.0);
-            ui.set_min_height(308.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.mixer_outputs, false, "MIXER");
                 if ui.selectable_value(&mut self.mixer_outputs, true, "MASTER / PHONES").clicked() {
@@ -2002,6 +3167,16 @@ impl RustDj {
                 let label = if self.broadcaster.recording_busy() { "STREAMER / REC" } else { "STREAMER" };
                 if ui.add(egui::Button::new(label).small().selected(active)).on_hover_text("Stream the master to SHOUTcast and record MP3").clicked() {
                     self.show_streamer = true;
+                }
+                let limiting = self.master_limiter && self.limiter_reduction >= 0.01;
+                let label = if limiting { format!("LIM {:.1}", peak_db(1.0 - self.limiter_reduction)) } else { "Limiter".into() };
+                let color = if limiting { WARNING } else { ui.visuals().text_color() };
+                if ui.add(egui::Button::new(RichText::new(label).color(color)).small().selected(self.master_limiter))
+                    .on_hover_text("Master limiter: -1 dBFS peak ceiling for speakers, stream and recording.")
+                    .clicked() {
+                    self.master_limiter = !self.master_limiter;
+                    self.audio.limiter.set(self.master_limiter);
+                    self.audio_dirty = true;
                 }
             });
             ui.separator();
@@ -2026,48 +3201,39 @@ impl RustDj {
                     stereo_meter_ui(ui, self.bus_levels[1], "PHONES", LIGHT_PURPLE);
                 });
             } else {
-                ui.columns(COUNT, |columns| {
-                    for (slot, index) in ORDER.into_iter().enumerate() {
-                        channel_strip(&mut columns[slot], &mut self.decks[index], deck_color(index), index);
+                let order = self.deck_layout.order();
+                ui.columns(order.len(), |columns| {
+                    for (column, &index) in columns.iter_mut().zip(order) {
+                        channel_strip(column, &mut self.decks[index], deck_color(index), index);
                     }
                 });
             }
             ui.separator();
             output_levels_ui(ui, &mut self.master, &mut self.phones, &mut self.mixing);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "MASTER {}",
-                        peak_text(self.bus_levels[0][0].max(self.bus_levels[0][1]))
-                    ))
-                    .size(11.0)
-                    .color(PURPLE),
-                );
-                ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "PHONES {}",
-                        peak_text(self.bus_levels[1][0].max(self.bus_levels[1][1]))
-                    ))
-                    .size(11.0)
-                    .color(LIGHT_PURPLE),
-                );
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (index, label, color) in [(0, "MASTER", PURPLE), (1, "PHONES", LIGHT_PURPLE)] {
+                    let [left, right] = self.bus_levels[index];
+                    let text = RichText::new(format!("{label} {}", peak_text(left.max(right))))
+                        .size(10.0)
+                        .color(color);
+                    ui.add_sized([91.0, 17.0], egui::Label::new(text).truncate());
+                    ui.separator();
+                }
+                self.mic_mixer_ui(ui);
             });
             ui.separator();
             ui.horizontal(|ui| {
                 let mut enabled = self.crossfader.enabled;
-                if ui.checkbox(&mut enabled, "CROSSFADER").changed() {
+                if ui.checkbox(&mut enabled, "Crossfader").changed() {
                     self.crossfader.set_enabled(enabled);
                 }
-                ui.label(
-                    RichText::new(if self.crossfader.enabled { "ON" } else { "OFF" })
-                        .strong()
-                        .color(if self.crossfader.enabled { PURPLE } else { MUTED }),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("1/3").color(PURPLE));
-                ui.spacing_mut().slider_width = width - 74.0;
+                let (left, right) = match self.deck_layout {
+                    DeckLayout::Two => ("1", "2"),
+                    DeckLayout::Four => ("1/3", "4/2"),
+                };
+                ui.label(RichText::new(left).color(PURPLE));
+                ui.spacing_mut().slider_width = (ui.available_width() - 28.0).max(52.0);
                 let mut position = self.crossfader.position;
                 if ui.add_enabled(
                     self.crossfader.enabled,
@@ -2075,7 +3241,7 @@ impl RustDj {
                 ).on_hover_text("OFF: centered; MIDI and keyboard movements are ignored.").changed() {
                     self.crossfader.set_position(position);
                 }
-                ui.label(RichText::new("4/2").color(LIGHT_PURPLE));
+                ui.label(RichText::new(right).color(LIGHT_PURPLE));
             });
             if self.bus_levels.iter().flatten().any(|peak| *peak >= 1.0) {
                 ui.colored_label(WARNING, "CLIP · Reduce output level");
@@ -2114,8 +3280,10 @@ impl RustDj {
                 self.wave_window = (self.wave_window / 2.0).max(1.0);
             }
         });
-        let lane_height = ((ui.available_height() - 6.0) / COUNT as f32).max(22.0);
-        for index in ORDER {
+        let order = self.deck_layout.order();
+        let spacing = ui.spacing().item_spacing.y * (order.len() - 1) as f32;
+        let lane_height = ((ui.available_height() - spacing) / order.len() as f32).max(17.0);
+        for &index in order {
             let deck = &mut self.decks[index];
             let colour = deck_color(index);
             let position = deck.position().as_secs_f64();
@@ -2204,9 +3372,10 @@ impl RustDj {
     }
 }
 
-pub(crate) fn console_dimensions(width: f32) -> (f32, f32) {
+pub(crate) fn console_dimensions(width: f32, layout: DeckLayout) -> (f32, f32) {
     let mixer = (width * 0.32).clamp(400.0, 480.0);
-    (mixer, (width - mixer - 24.0) * 0.25)
+    let decks = layout.order().len() as f32;
+    (mixer, (width - mixer - 6.0 * decks) / decks)
 }
 
 fn controller_status(port: Option<&str>, auto: bool) -> String {
@@ -2292,8 +3461,8 @@ fn stereo_meter_ui(ui: &mut egui::Ui, levels: [f32; 2], label: &str, color: Colo
         ui.set_width(102.0);
         ui.label(RichText::new(label).strong().color(color));
         ui.horizontal_top(|ui| {
-            meter_ui(ui, levels[0], color, "L", 172.0);
-            meter_ui(ui, levels[1], color, "R", 172.0);
+            meter_ui(ui, levels[0], color, "L", 104.0);
+            meter_ui(ui, levels[1], color, "R", 104.0);
         });
     });
 }
@@ -2442,9 +3611,12 @@ mod console_meter_tests {
     #[test]
     fn console_meter_layout_status_and_numeric_levels_cover_supported_sizes() {
         for width in [1268.0, 1668.0, 1908.0] {
-            let (mixer, deck) = console_dimensions(width);
-            assert!(mixer >= 400.0 && deck >= 200.0);
-            assert!((mixer + deck * 4.0 + 24.0 - width).abs() < 0.01);
+            for layout in [DeckLayout::Two, DeckLayout::Four] {
+                let (mixer, deck) = console_dimensions(width, layout);
+                let deck_count = layout.order().len() as f32;
+                assert!(mixer >= 400.0 && deck >= 200.0);
+                assert!((mixer + (deck + 6.0) * deck_count - width).abs() < 0.01);
+            }
         }
         assert!(controller_status(Some("DJ-202"), false).contains("ON · DJ-202"));
         assert!(controller_status(None, true).contains("OFF"));

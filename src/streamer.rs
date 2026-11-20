@@ -32,14 +32,23 @@ pub struct StreamSettings {
     pub url: String,
     pub bitrate: u16,
     pub send_tags: bool,
+    pub reconnect: bool,
     pub automatic_title: bool,
     pub manual_title: String,
     pub recording_dir: PathBuf,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamProfile {
+    pub id: u64,
+    pub name: String,
+    pub settings: StreamSettings,
+}
+
 impl Default for StreamSettings {
     fn default() -> Self {
         let base = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
@@ -54,6 +63,7 @@ impl Default for StreamSettings {
             url: String::new(),
             bitrate: 192,
             send_tags: false,
+            reconnect: false,
             automatic_title: true,
             manual_title: String::new(),
             recording_dir: base.join("Music").join("RustDJ-Recordings"),
@@ -91,6 +101,7 @@ pub enum Phase {
     Idle,
     Starting,
     Running,
+    Reconnecting,
     Stopping,
     Done,
     Error,
@@ -112,6 +123,7 @@ impl Status {
             Phase::Idle => "OFF",
             Phase::Starting => "STARTING …",
             Phase::Running => "ACTIVE",
+            Phase::Reconnecting => "RECONNECTING …",
             Phase::Stopping => "STOPPING …",
             Phase::Done => "STOPPED",
             Phase::Error => "ERROR",
@@ -168,7 +180,10 @@ impl Job {
     fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         update(&self.status, |status| {
-            if matches!(status.phase, Phase::Starting | Phase::Running) {
+            if matches!(
+                status.phase,
+                Phase::Starting | Phase::Running | Phase::Reconnecting
+            ) {
                 status.phase = Phase::Stopping;
             }
         });
@@ -217,39 +232,7 @@ impl Broadcaster {
             .enabled = settings.send_tags;
         let metadata = self.metadata.clone();
         self.stream_job = Some(Job::spawn(move |stop, status| {
-            let connector = Connector::default();
-            let mut socket = open_source(&connector, &settings, &password, &stop)?;
-            let encoder = encoder(capture.sample_rate, settings.bitrate)?;
-            let tag_stop = Arc::new(AtomicBool::new(false));
-            let thread_tag_stop = tag_stop.clone();
-            let tag_status = status.clone();
-            let tag_thread = thread::spawn(move || {
-                metadata_loop(
-                    settings,
-                    password,
-                    metadata,
-                    thread_tag_stop,
-                    tag_status,
-                    connector,
-                )
-            });
-            let mut output = NetworkWriter {
-                socket: &mut socket,
-                stop: &stop,
-                stop_deadline: None,
-            };
-            let result = encode_master(
-                capture.stream.clone(),
-                capture.sample_rate,
-                encoder,
-                &stop,
-                &status,
-                &mut output,
-            );
-            tag_stop.store(true, Ordering::Release);
-            let _ = socket.shutdown();
-            let _ = tag_thread.join();
-            result
+            run_broadcast(&capture, settings, password, metadata, &stop, &status)
         }));
         self.poll();
         Ok(())
@@ -286,7 +269,7 @@ impl Broadcaster {
                 .flush()
                 .and_then(|_| file.get_ref().sync_all())
                 .map_err(|e| format!("Could not finalize MP3: {e}"));
-            result.and(finalized)
+            result.map_err(|error| error.message).and(finalized)
         }));
         self.poll();
         Ok(())
@@ -389,6 +372,122 @@ impl Drop for CaptureSession {
     }
 }
 
+struct EncodeError {
+    message: String,
+    output: bool,
+}
+
+impl EncodeError {
+    fn encoding(message: String) -> Self {
+        Self {
+            message,
+            output: false,
+        }
+    }
+
+    fn output(message: String) -> Self {
+        Self {
+            message,
+            output: true,
+        }
+    }
+}
+
+fn run_broadcast(
+    capture: &MasterCapture,
+    settings: StreamSettings,
+    password: String,
+    metadata: Arc<Mutex<Metadata>>,
+    stop: &AtomicBool,
+    status: &SharedStatus,
+) -> Result<(), String> {
+    let connector = Connector::default();
+    let mut socket = open_source(&connector, &settings, &password, stop)?;
+    let mut attempts = 0;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let encoder = encoder(capture.sample_rate, settings.bitrate)?;
+        let tag_stop = Arc::new(AtomicBool::new(false));
+        let tag_thread = {
+            let (settings, password, metadata, stop, status, connector) = (
+                settings.clone(),
+                password.clone(),
+                metadata.clone(),
+                tag_stop.clone(),
+                status.clone(),
+                connector.clone(),
+            );
+            thread::spawn(move || {
+                metadata_loop(settings, password, metadata, stop, status, connector)
+            })
+        };
+        let started = Instant::now();
+        let result = encode_master(
+            capture.stream.clone(),
+            capture.sample_rate,
+            encoder,
+            stop,
+            status,
+            &mut NetworkWriter {
+                socket: &mut socket,
+                stop,
+                stop_deadline: None,
+            },
+        );
+        tag_stop.store(true, Ordering::Release);
+        let _ = socket.shutdown();
+        let _ = tag_thread.join();
+        let Err(error) = result else { return Ok(()) };
+        if !settings.reconnect || !error.output || stop.load(Ordering::Acquire) {
+            return Err(error.message);
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            attempts = 0;
+        }
+        let mut failure = error.message;
+        loop {
+            if attempts == 5 {
+                return Err(format!("Reconnect failed: {failure}"));
+            }
+            let delay = 1 << attempts;
+            attempts += 1;
+            update(status, |status| {
+                status.phase = Phase::Reconnecting;
+                status.message = format!("Attempt {attempts} of 5 in {delay}s. {failure}");
+            });
+            let deadline = Instant::now() + Duration::from_secs(delay);
+            while Instant::now() < deadline {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let mut connection = match connector.connect(
+                &settings.host,
+                settings.source_port,
+                settings.security,
+                stop,
+            ) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    failure = error;
+                    continue;
+                }
+            };
+            // A rejected source login is terminal. TLS is always verified by
+            // the same connector used for the original connection.
+            authenticate(&mut connection, &settings, &password, stop)?;
+            socket = connection;
+            break;
+        }
+    }
+}
+
 fn encode_master(
     buffer: Arc<PcmBuffer>,
     rate: u32,
@@ -396,17 +495,19 @@ fn encode_master(
     stop: &AtomicBool,
     status: &SharedStatus,
     output: &mut impl Write,
-) -> Result<(), String> {
+) -> Result<(), EncodeError> {
     let _session = CaptureSession(buffer.clone());
     let mut pcm = Vec::with_capacity(4096);
     let mut mp3 = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(2048).max(7200));
     buffer.begin();
-    update(status, |status| {
-        status.phase = Phase::Running;
-        status.message = "Processing master audio".into();
-    });
+    let (mut bytes, elapsed) = {
+        let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
+        state.phase = Phase::Running;
+        state.message = "Processing master audio".into();
+        state.metadata_error = None;
+        (state.bytes, state.seconds)
+    };
     let mut frames = 0_u64;
-    let mut bytes = 0_u64;
     let mut ending = false;
     let mut overflow = false;
     loop {
@@ -426,27 +527,27 @@ fn encode_master(
         mp3.clear();
         encoder
             .encode_to_vec(InterleavedPcm(&pcm), &mut mp3)
-            .map_err(|e| format!("MP3 encoding failed: {e}"))?;
+            .map_err(|e| EncodeError::encoding(format!("MP3 encoding failed: {e}")))?;
         output
             .write_all(&mp3)
-            .map_err(|e| format!("MP3 output interrupted: {e}"))?;
+            .map_err(|e| EncodeError::output(format!("MP3 output interrupted: {e}")))?;
         frames += count as u64;
         bytes += mp3.len() as u64;
         update(status, |status| {
             status.bytes = bytes;
-            status.seconds = frames as f64 / rate as f64;
+            status.seconds = elapsed + frames as f64 / rate as f64;
         });
     }
     mp3.clear();
     encoder
         .flush_to_vec::<FlushGap>(&mut mp3)
-        .map_err(|e| format!("MP3 finalization failed: {e}"))?;
+        .map_err(|e| EncodeError::encoding(format!("MP3 finalization failed: {e}")))?;
     output
         .write_all(&mp3)
-        .map_err(|e| format!("Could not write MP3 finalization data: {e}"))?;
+        .map_err(|e| EncodeError::output(format!("Could not write MP3 finalization data: {e}")))?;
     update(status, |status| status.bytes = bytes + mp3.len() as u64);
     if overflow {
-        Err("Master buffer overflow; output stopped. The encoder, server or disk could not keep up.".into())
+        Err(EncodeError::output("Master buffer overflow; output stopped. The encoder, server or disk could not keep up.".into()))
     } else {
         Ok(())
     }
@@ -749,6 +850,90 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_resumes_streaming_after_a_live_socket_is_closed() {
+        use std::{net::Shutdown, sync::mpsc};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (sent, received) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let deadline = Instant::now() + Duration::from_secs(7);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "no source connection");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "local-test");
+                socket.write_all(b"OK2\r\n").unwrap();
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                reader.read_exact(&mut [0; 1024]).unwrap();
+                if attempt == 0 {
+                    socket.shutdown(Shutdown::Both).unwrap();
+                }
+                sent.send(attempt).unwrap();
+                if attempt == 1 {
+                    let mut unused = Vec::new();
+                    reader.read_to_end(&mut unused).unwrap();
+                }
+            }
+        });
+
+        let capture = Arc::new(MasterCapture::new(44100));
+        let mut broadcaster = Broadcaster::default();
+        broadcaster
+            .start_stream(
+                capture.clone(),
+                StreamSettings {
+                    host: "127.0.0.1".into(),
+                    source_port,
+                    security: ConnectionSecurity::Plaintext,
+                    reconnect: true,
+                    ..StreamSettings::default()
+                },
+                "local-test".into(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(7);
+        let mut reconnecting = false;
+        loop {
+            broadcaster.poll();
+            reconnecting |= broadcaster.stream_status.phase == Phase::Reconnecting;
+            if received.try_iter().any(|attempt| attempt == 1) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{:?}", broadcaster.stream_status);
+            for _ in 0..1024 {
+                capture.push([0.2, -0.2]);
+            }
+            thread::sleep(Duration::from_millis(12));
+        }
+        assert!(reconnecting);
+        broadcaster.stop_stream();
+        wait(&mut broadcaster, |b| !b.stream_busy());
+        assert_eq!(broadcaster.stream_status.phase, Phase::Done);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn streamer16_local_shoutcast_login_mp3_optional_tags_and_independent_failures() {
         for enabled in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -887,7 +1072,7 @@ mod tests {
         // A rejected source login must leave an independent recording running.
         let directory = tempfile::Builder::new()
             .prefix("streamer16-error-")
-            .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("work"))
+            .tempdir()
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let source_port = listener.local_addr().unwrap().port();
