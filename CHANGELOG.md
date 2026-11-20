@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.2
+
+- AutoDJ opens the first entry on Start and advances through the list independently of the interface. Stop cancels the current track and any pending load.
+
 ## 0.24.1
 
 - Added a saved AutoDJ playlist with automatic playback in order through the master mix, plus start, stop and skip controls.

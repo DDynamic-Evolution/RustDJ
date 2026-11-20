@@ -2283,7 +2283,8 @@ impl eframe::App for RustDj {
                         self.audio_dirty |= self.autodj.ui(
                             ui,
                             ctx,
-                            self.audio.stream.is_some() && self.audio.bus(false).is_some(),
+                            &self.audio,
+                            self.master * self.talkover.gain(),
                             self.browser.selected_path(),
                             &self.playlist.items,
                         );
@@ -2322,8 +2323,7 @@ impl eframe::App for RustDj {
         self.history_ui(ctx);
         self.grid_editor_ui(ctx);
         self.jingles.update(self.master);
-        self.autodj
-            .update(&self.audio, self.master * self.talkover.gain(), ctx);
+        self.autodj.set_gain(self.master * self.talkover.gain());
         self.playlist.confirm_changes(ctx);
         if let Some((target, music)) = drops.finish(ctx) {
             match target {
@@ -2421,10 +2421,11 @@ impl eframe::App for RustDj {
         let dominant = (0..COUNT)
             .filter(|i| self.decks[*i].playing() && gains.master[*i] > 0.0001)
             .max_by(|a, b| gains.master[*a].total_cmp(&gains.master[*b]));
+        let autodj_title = self.autodj.current_title();
         let title = if self.stream_settings.automatic_title {
             dominant
                 .and_then(|i| self.decks[i].track.as_ref().map(|t| t.title.as_str()))
-                .or_else(|| self.autodj.current_title())
+                .or(autodj_title.as_deref())
                 .unwrap_or(&self.stream_settings.station)
         } else {
             &self.stream_settings.manual_title
