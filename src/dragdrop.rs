@@ -26,6 +26,7 @@ pub enum Target {
     Session,
     /// None appends; Some inserts before the given item.
     Playlist(Option<usize>),
+    AutoDj,
 }
 
 struct Zone {

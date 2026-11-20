@@ -1,6 +1,6 @@
 [package]
 name = "rustdj"
-version = "0.23.8"
+version = "0.24.1"
 edition = "2024"
 description = "A Rust-based DJ application"
 rust-version = "1.88"
@@ -9,6 +9,7 @@ rust-version = "1.88"
 eframe = { version = "=0.33.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 rodio = { version = "=0.21.1", default-features = false, features = ["playback", "symphonia-all"] }
 rfd = "=0.15.4"
+symphonia = { version = "=0.5.5", default-features = false }
 midir = "=0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

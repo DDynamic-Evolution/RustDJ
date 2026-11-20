@@ -53,6 +53,8 @@ fn path_key(path: &Path) -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
+    #[serde(default)]
+    pub tags: Option<crate::track::Tags>,
     pub duration_ms: u64,
     pub grid: Option<BeatGrid>,
     pub key: Option<MusicalKey>,
@@ -60,6 +62,7 @@ pub struct Summary {
 impl Summary {
     pub fn from_track(track: &Track) -> Self {
         Self {
+            tags: track.tags.clone(),
             duration_ms: track.duration.as_millis() as u64,
             grid: track.grid,
             key: track.key,
@@ -113,6 +116,13 @@ pub struct HistoryEntry {
     pub deck: usize,
 }
 
+pub struct CollectionTrack {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub summary: Summary,
+    pub stale: bool,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -163,6 +173,17 @@ impl Database {
                 .map_err(|e| e.to_string())?;
         }
         Ok(Self { connection })
+    }
+
+    pub fn clear_collection(&mut self) -> Result<usize, String> {
+        let clear = (|| -> rusqlite::Result<usize> {
+            let transaction = self.connection.transaction()?;
+            let removed = transaction.execute("DELETE FROM analyses", [])?;
+            transaction.execute("DELETE FROM colour_waveforms", [])?;
+            transaction.commit()?;
+            Ok(removed)
+        })();
+        clear.map_err(|error| format!("Could not clear the collection: {error}"))
     }
 
     pub fn grid_correction(
@@ -242,6 +263,110 @@ impl Database {
             .map_err(|error| error.to_string())
     }
 
+    pub fn search_collection(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<CollectionTrack>, String> {
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path,file_size,analysis_version,result_json FROM analyses ORDER BY path",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+        let mut matches = Vec::new();
+        while matches.len() < limit {
+            let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+                break;
+            };
+            let path: String = row.get(0).map_err(|e| e.to_string())?;
+            let raw = row.get_ref(3).map_err(|e| e.to_string())?;
+            let Ok(json) = raw.as_str() else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_str::<Stored>(json) else {
+                continue;
+            };
+            if !stored.valid() {
+                continue;
+            }
+            let summary = stored.summary;
+            if !terms.is_empty() {
+                let mut search = path.to_lowercase();
+                if let Some(tags) = &summary.tags {
+                    for value in tags.values.iter().chain([
+                        &tags.title,
+                        &tags.artist,
+                        &tags.album,
+                        &tags.genre,
+                    ]) {
+                        search.push(' ');
+                        search.push_str(&value.to_lowercase());
+                    }
+                }
+                if let Some(bpm) = summary.bpm() {
+                    search.push_str(&format!(" {bpm:.1}"));
+                }
+                if let Some(key) = summary.key {
+                    search.push_str(&format!(" {}", key.label().to_lowercase()));
+                }
+                if !terms.iter().all(|term| search.contains(term)) {
+                    continue;
+                }
+            }
+            let bytes: i64 = row.get(1).map_err(|e| e.to_string())?;
+            let version: i64 = row.get(2).map_err(|e| e.to_string())?;
+            matches.push(CollectionTrack {
+                path: PathBuf::from(path),
+                bytes: bytes.max(0) as u64,
+                summary,
+                stale: version != ANALYSIS_VERSION,
+            });
+        }
+        Ok(matches)
+    }
+
+    pub fn untagged_paths(&self) -> Result<Vec<(PathBuf, Fingerprint)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path,file_size,modified_ns FROM analyses
+             WHERE json_valid(result_json) AND json_extract(result_json,'$.summary.tags') IS NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    Fingerprint {
+                        bytes: row.get(1)?,
+                        modified_ns: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_tags(
+        &self,
+        path: &Path,
+        identity: &Fingerprint,
+        tags: &crate::track::Tags,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(tags).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE analyses SET result_json=json_set(result_json,'$.summary.tags',json(?4))
+             WHERE path=?1 AND file_size=?2 AND modified_ns=?3
+                   AND json_valid(result_json) AND json_extract(result_json,'$.summary.tags') IS NULL",
+            params![path_key(path), identity.bytes, identity.modified_ns, json],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn lookup(&self, path: &Path, identity: &Fingerprint) -> Result<Lookup, String> {
         let row: Option<(i64, String, i64, String)> = self.connection.query_row(
             "SELECT file_size, modified_ns, analysis_version, result_json FROM analyses WHERE path=?1",
@@ -295,6 +420,7 @@ impl Database {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            tags: stored.summary.tags,
             duration: Duration::from_nanos(stored.duration_ns),
             waveform,
             sample_rate: stored.sample_rate,
@@ -407,6 +533,50 @@ fn decode_peaks(bytes: &[u8]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn clearing_collection_keeps_media_and_performance_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("track.wav");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/demo-a.wav"),
+            &path,
+        )
+        .unwrap();
+        let track = crate::track::analyze(path.clone(), &AtomicBool::new(false)).unwrap();
+        let identity = Fingerprint::read(&path).unwrap();
+        let mut db = Database::open(&directory.path().join("library.sqlite3")).unwrap();
+        db.save(&track, &identity).unwrap();
+        let mut cues = [None; 8];
+        cues[0] = Some(Duration::from_millis(500));
+        db.save_hotcues(&path, &identity, cues).unwrap();
+        let grid = BeatGrid {
+            bpm: 120.0,
+            offset: 0.5,
+            confidence: 1.0,
+        };
+        db.save_grid_correction(&path, &identity, Some(grid))
+            .unwrap();
+        db.log_play("Track", &path, 1, 1_762_000_000).unwrap();
+
+        assert_eq!(db.clear_collection().unwrap(), 1);
+        assert_eq!(db.count().unwrap(), 0);
+        let cached_waveforms: i64 = db
+            .connection
+            .query_row("SELECT count(*) FROM colour_waveforms", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cached_waveforms, 0);
+        assert_eq!(Fingerprint::read(&path).unwrap(), identity);
+        assert_eq!(db.hotcues(&path, &identity).unwrap(), cues);
+        assert_eq!(
+            db.grid_correction(&path, &identity).unwrap().unwrap().bpm,
+            grid.bpm
+        );
+        assert_eq!(db.history(1).unwrap().len(), 1);
+    }
+
     #[test]
     fn saved_grid_and_play_history_survive_database_reopen() {
         let directory = tempfile::tempdir().unwrap();

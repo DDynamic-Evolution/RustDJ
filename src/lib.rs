@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod app;
 pub mod audio;
+mod autodj;
 pub mod beat;
 pub mod branding;
 pub mod browser;

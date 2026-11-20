@@ -1,6 +1,7 @@
 use crate::beat::{self, BeatGrid};
 use crate::key::{KeyAnalyzer, MusicalKey};
 use rodio::{Decoder, Source};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::BufReader,
@@ -11,13 +12,89 @@ use std::{
     },
     time::Duration,
 };
+use symphonia::core::{
+    formats::FormatOptions,
+    io::{MediaSourceStream, MediaSourceStreamOptions},
+    meta::{MetadataOptions, MetadataRevision, StandardTagKey, Value},
+    probe::Hint,
+};
 
 pub const EXTENSIONS: &[&str] = &["mp3", "wav", "flac", "ogg", "m4a", "aac", "aiff"];
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tags {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: String,
+    pub values: Vec<String>,
+}
+
+impl Tags {
+    fn read_revision(&mut self, revision: &MetadataRevision) {
+        for tag in revision.tags() {
+            if self.values.len() == 64 || matches!(tag.value, Value::Binary(_) | Value::Flag) {
+                continue;
+            }
+            let value: String = tag.value.to_string().trim().chars().take(512).collect();
+            if value.is_empty() {
+                continue;
+            }
+            let primary = match tag.std_key {
+                Some(StandardTagKey::TrackTitle) => Some(&mut self.title),
+                Some(StandardTagKey::Artist) => Some(&mut self.artist),
+                Some(StandardTagKey::Album) => Some(&mut self.album),
+                Some(StandardTagKey::Genre) => Some(&mut self.genre),
+                _ => None,
+            };
+            if let Some(field) = primary
+                && field.is_empty()
+            {
+                *field = value.clone();
+            }
+            if !self.values.contains(&value) {
+                self.values.push(value);
+            }
+        }
+    }
+}
+
+pub fn read_tags(path: &Path) -> Tags {
+    let mut tags = Tags::default();
+    let Ok(file) = File::open(path) else {
+        return tags;
+    };
+    let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let options = MetadataOptions {
+        limit_metadata_bytes: symphonia::core::meta::Limit::Maximum(256 * 1024),
+        limit_visual_bytes: symphonia::core::meta::Limit::Maximum(4 * 1024 * 1024),
+    };
+    let Ok(mut probed) =
+        symphonia::default::get_probe().format(&hint, stream, &FormatOptions::default(), &options)
+    else {
+        return tags;
+    };
+    if let Some(metadata) = probed.format.metadata().current() {
+        tags.read_revision(metadata);
+    }
+    if let Some(probed_metadata) = probed.metadata.get()
+        && let Some(metadata) = probed_metadata.current()
+    {
+        tags.read_revision(metadata);
+    }
+    tags
+}
 
 #[derive(Clone, Debug)]
 pub struct Track {
     pub path: PathBuf,
     pub title: String,
+    pub tags: Option<Tags>,
     pub duration: Duration,
     pub waveform: Vec<f32>,
     pub sample_rate: u32,
@@ -109,9 +186,11 @@ pub fn analyze(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
         return Err("Loading cancelled.".into());
     }
     let key = key_analysis.finish();
+    let tags = Some(read_tags(&path));
     Ok(Track {
         path,
         title,
+        tags,
         duration,
         waveform: reduce_peaks(&peaks, 900),
         sample_rate,

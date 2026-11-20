@@ -1,5 +1,6 @@
 use crate::{
     audio::{Audio, Deck},
+    autodj::AutoDj,
     beat::{BeatGrid, sync_plan},
     broadcast_mix::{Talkover, TalkoverSettings},
     browser::{Browser, Event as BrowserEvent},
@@ -37,6 +38,13 @@ const AUX_INPUT_COUNT: usize = 2;
 const MIC: usize = AUX_INPUT_COUNT;
 const INPUT_COUNT: usize = AUX_INPUT_COUNT + 1;
 const WARNING: Color32 = Color32::from_rgb(247, 101, 112);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibraryTab {
+    Session,
+    Playlist,
+    AutoDj,
+}
 
 struct Crossfader {
     position: f32,
@@ -140,7 +148,8 @@ pub struct RustDj {
     audio_dirty: bool,
     library: Vec<Item>,
     playlist: Playlist,
-    playlist_tab: bool,
+    library_tab: LibraryTab,
+    autodj: AutoDj,
     search: String,
     active: usize,
     deck_layout: DeckLayout,
@@ -267,7 +276,8 @@ impl RustDj {
             audio_dirty: migrated,
             library: Vec::new(),
             playlist: Playlist::default(),
-            playlist_tab: false,
+            library_tab: LibraryTab::Session,
+            autodj: AutoDj::new(settings.autodj),
             search: String::new(),
             active: 0,
             deck_layout: settings.deck_layout,
@@ -335,7 +345,7 @@ impl RustDj {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        if ctx.wants_keyboard_input() || self.browser.confirmation_open() {
             return;
         }
         for (key, deck) in [
@@ -1900,6 +1910,7 @@ impl RustDj {
                 audio.master_eq.set(self.master_eq);
                 audio.limiter.set(self.master_limiter);
                 self.jingles.stop_all();
+                let autodj_was_running = self.autodj.stop();
                 let mut errors = Vec::new();
                 for deck in &mut self.decks {
                     if let Err(error) = deck.rebind(&audio) {
@@ -1916,6 +1927,9 @@ impl RustDj {
                 }
                 self.routing_edit = self.audio.routing.clone();
                 self.audio_dirty = true;
+                if autodj_was_running {
+                    errors.push("AutoDJ stopped after changing audio outputs.".into());
+                }
                 self.notice = Some(if errors.is_empty() {
                     "Audio outputs applied; playback positions preserved.".into()
                 } else {
@@ -2233,47 +2247,71 @@ impl eframe::App for RustDj {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let session = ui.selectable_value(&mut self.playlist_tab, false, "SESSION");
+                    let tab = &mut self.library_tab;
+                    let session = ui.selectable_value(tab, LibraryTab::Session, "SESSION");
                     drops.add(DropTarget::Session, session.rect, ui.layer_id());
-                    let playlist = ui.selectable_value(&mut self.playlist_tab, true, "PLAYLIST");
+                    let playlist = ui.selectable_value(tab, LibraryTab::Playlist, "PLAYLIST");
                     drops.add(DropTarget::Playlist(None), playlist.rect, ui.layer_id());
+                    let autodj = ui.selectable_value(tab, LibraryTab::AutoDj, "AutoDJ");
+                    drops.add(DropTarget::AutoDj, autodj.rect, ui.layer_id());
                     if playlist.clicked() {
                         self.playlist.refresh(ctx);
                     }
                 });
                 ui.separator();
                 drops.add(
-                    if self.playlist_tab {
-                        DropTarget::Playlist(None)
-                    } else {
-                        DropTarget::Session
+                    match self.library_tab {
+                        LibraryTab::Session => DropTarget::Session,
+                        LibraryTab::Playlist => DropTarget::Playlist(None),
+                        LibraryTab::AutoDj => DropTarget::AutoDj,
                     },
                     ui.available_rect_before_wrap(),
                     ui.layer_id(),
                 );
-                if self.playlist_tab {
-                    if let Some((index, path)) =
-                        self.playlist.ui(ui, ctx, self.active, deck_order, &mut drops)
-                    {
+                match self.library_tab {
+                    LibraryTab::Session => self.library_ui(ui, ctx),
+                    LibraryTab::Playlist => {
+                        if let Some((index, path)) =
+                            self.playlist
+                                .ui(ui, ctx, self.active, deck_order, &mut drops)
+                        {
+                            self.decks[index].load(path, ctx.clone());
+                            self.active = index;
+                        }
+                    }
+                    LibraryTab::AutoDj => {
+                        self.audio_dirty |= self.autodj.ui(
+                            ui,
+                            ctx,
+                            self.audio.stream.is_some() && self.audio.bus(false).is_some(),
+                            self.browser.selected_path(),
+                            &self.playlist.items,
+                        );
+                    }
+                }
+            });
+        let deck_loading = self.decks.iter().any(Deck::loading);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
+            .show(ctx, |ui| {
+                match self
+                    .browser
+                    .ui(ui, self.active, deck_order, ctx, deck_loading)
+                {
+                    Some(BrowserEvent::Load(index, path)) => {
                         self.decks[index].load(path, ctx.clone());
                         self.active = index;
                     }
-                } else {
-                    self.library_ui(ui, ctx);
+                    Some(BrowserEvent::Playlist(path)) => {
+                        self.playlist.add(vec![path], ctx);
+                        self.library_tab = LibraryTab::Playlist;
+                    }
+                    Some(BrowserEvent::AutoDj(path)) => {
+                        self.audio_dirty |= self.autodj.add([path]);
+                        self.library_tab = LibraryTab::AutoDj;
+                    }
+                    None => {}
                 }
-            });
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
-            .show(ctx, |ui| match self.browser.ui(ui, self.active, deck_order, ctx) {
-                Some(BrowserEvent::Load(index, path)) => {
-                    self.decks[index].load(path, ctx.clone());
-                    self.active = index;
-                }
-                Some(BrowserEvent::Playlist(path)) => {
-                    self.playlist.add(vec![path], ctx);
-                    self.playlist_tab = true;
-                }
-                None => {}
             });
         self.controller_ui(ctx);
         self.audio_ui(ctx);
@@ -2284,6 +2322,8 @@ impl eframe::App for RustDj {
         self.history_ui(ctx);
         self.grid_editor_ui(ctx);
         self.jingles.update(self.master);
+        self.autodj
+            .update(&self.audio, self.master * self.talkover.gain(), ctx);
         self.playlist.confirm_changes(ctx);
         if let Some((target, music)) = drops.finish(ctx) {
             match target {
@@ -2293,7 +2333,7 @@ impl eframe::App for RustDj {
                 }
                 DropTarget::Session => {
                     upsert_session(&mut self.library, music.item);
-                    self.playlist_tab = false;
+                    self.library_tab = LibraryTab::Session;
                 }
                 DropTarget::Playlist(index) => {
                     if let Origin::Playlist(source) = music.origin {
@@ -2301,7 +2341,11 @@ impl eframe::App for RustDj {
                     } else {
                         self.playlist.insert(music.item, index, ctx);
                     }
-                    self.playlist_tab = true;
+                    self.library_tab = LibraryTab::Playlist;
+                }
+                DropTarget::AutoDj => {
+                    self.audio_dirty |= self.autodj.add([music.item.path]);
+                    self.library_tab = LibraryTab::AutoDj;
                 }
             }
         }
@@ -2334,7 +2378,7 @@ impl eframe::App for RustDj {
                     for path in external_music {
                         upsert_session(&mut self.library, Item::new(path, None));
                     }
-                    self.playlist_tab = false;
+                    self.library_tab = LibraryTab::Session;
                 }
                 Some(DropTarget::Playlist(index)) => {
                     self.playlist.insert_many(
@@ -2345,7 +2389,11 @@ impl eframe::App for RustDj {
                         index,
                         ctx,
                     );
-                    self.playlist_tab = true;
+                    self.library_tab = LibraryTab::Playlist;
+                }
+                Some(DropTarget::AutoDj) => {
+                    self.audio_dirty |= self.autodj.add(external_music);
+                    self.library_tab = LibraryTab::AutoDj;
                 }
                 None => {}
             }
@@ -2376,6 +2424,7 @@ impl eframe::App for RustDj {
         let title = if self.stream_settings.automatic_title {
             dominant
                 .and_then(|i| self.decks[i].track.as_ref().map(|t| t.title.as_str()))
+                .or_else(|| self.autodj.current_title())
                 .unwrap_or(&self.stream_settings.station)
         } else {
             &self.stream_settings.manual_title
@@ -2444,6 +2493,7 @@ impl eframe::App for RustDj {
                 master_limiter: self.master_limiter,
                 jingles: self.jingles.settings.clone(),
                 master_eq: self.master_eq,
+                autodj: self.autodj.paths().to_vec(),
             };
             if let Err(error) = settings::save(&settings) {
                 self.notice = Some(error);
@@ -2739,82 +2789,8 @@ fn deck_ui(
                     deck.stop(audio);
                 }
             });
-            ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(50.0, 62.0),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        fx_knob(ui, "FILTER", &mut deck.filter, -1.0, 1.0, 0.0, color);
-                    },
-                );
-                ui.allocate_ui_with_layout(
-                    Vec2::new(50.0, 62.0),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        fx_knob(ui, "FX LEVEL", &mut deck.fx_level, 0.0, 1.0, 0.25, color);
-                    },
-                );
-                ui.vertical(|ui| {
-                    ui.set_width(50.0);
-                    for (slot, label) in ["FLG", "REV", "ECHO"].into_iter().enumerate() {
-                        if ui
-                            .add(
-                                egui::Button::new(label)
-                                    .small()
-                                    .selected(deck.fx_enabled[slot]),
-                            )
-                            .clicked()
-                        {
-                            deck.fx_enabled[slot] = !deck.fx_enabled[slot];
-                        }
-                    }
-                });
-            });
-            let pad_width = ((width - 18.0 - 21.0) / 8.0).max(17.0);
-            ui.label(RichText::new("HOTCUES").size(9.0).color(MUTED));
-            ui.horizontal(|ui| {
-                for slot in 0..8 {
-                    let saved = deck.hotcues[slot];
-                    let button = ui.add_enabled(
-                        deck.track.is_some(),
-                        egui::Button::new((slot + 1).to_string())
-                            .small()
-                            .selected(saved.is_some())
-                            .min_size(Vec2::new(pad_width, 20.0)),
-                    );
-                    if button.secondary_clicked()
-                        || (button.clicked() && ui.input(|i| i.modifiers.shift))
-                    {
-                        deck.clear_hotcue(slot);
-                    } else if button.clicked() {
-                        deck.hotcue(slot, audio);
-                        response.performance_changed = saved.is_some();
-                    }
-                    button.on_hover_text("Empty: set; assigned: jump. Shift/right-click: clear.");
-                }
-            });
-            ui.label(RichText::new("LOOPS · BEATS").size(9.0).color(MUTED));
-            ui.horizontal(|ui| {
-                for (beats, label) in LOOP_PRESETS {
-                    let selected = deck.loop_auto
-                        && (deck.loop_active || deck.loop_pending())
-                        && (deck.loop_beats - beats).abs() < 0.001;
-                    if ui
-                        .add_enabled(
-                            deck.track.is_some() && audio.stream.is_some(),
-                            egui::Button::new(label)
-                                .small()
-                                .selected(selected)
-                                .min_size(Vec2::new(pad_width, 20.0)),
-                        )
-                        .on_hover_text("Press again to exit the loop")
-                        .clicked()
-                    {
-                        deck.beat_loop(beats, audio);
-                        response.performance_changed = true;
-                    }
-                }
-            });
+            response.performance_changed |=
+                deck_performance_ui(ui, deck, audio, color, width - 18.0);
             if deck.loading() {
                 ui.label(RichText::new("Analyzing …").small().color(color));
             } else if let Some(error) = &deck.error {
@@ -2841,13 +2817,118 @@ fn deck_ui(
         })
 }
 
+fn deck_performance_ui(
+    ui: &mut egui::Ui,
+    deck: &mut Deck,
+    audio: &Audio,
+    color: Color32,
+    width: f32,
+) -> bool {
+    const EFFECT_WIDTH: f32 = 91.0;
+    const GAP: f32 = 6.0;
+
+    // Leave breathing room at the right edge for the widgets' own padding.
+    let pads_width = width - EFFECT_WIDTH - GAP - 8.0;
+    let side_by_side = pads_width >= 176.0;
+    let bank_width = if side_by_side {
+        (pads_width - GAP) / 2.0
+    } else {
+        pads_width
+    };
+    let pad_width = (bank_width - 9.0) / 4.0;
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        ui.allocate_ui_with_layout(
+            Vec2::new(EFFECT_WIDTH, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                ui.horizontal(|ui| {
+                    fx_knob(ui, "FILTER", &mut deck.filter, -1.0, 1.0, 0.0, color);
+                    fx_knob(ui, "FX LEVEL", &mut deck.fx_level, 0.0, 1.0, 0.25, color);
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().button_padding.x = 2.0;
+                    for (slot, (label, name)) in [("FLG", "Flanger"), ("REV", "Reverb"), ("ECHO", "Echo")]
+                        .into_iter().enumerate()
+                    {
+                        if ui.add(egui::Button::new(label).small().selected(deck.fx_enabled[slot]))
+                            .on_hover_text(name)
+                            .clicked()
+                        {
+                            deck.fx_enabled[slot] = !deck.fx_enabled[slot];
+                        }
+                    }
+                });
+            },
+        );
+        let layout = if side_by_side {
+            egui::Layout::left_to_right(egui::Align::Min)
+        } else {
+            egui::Layout::top_down(egui::Align::Min)
+        };
+        ui.allocate_ui_with_layout(Vec2::new(pads_width, 0.0), layout, |ui| {
+            let mut changed = false;
+            for (title, hotcues) in [("HOTCUES", true), ("LOOPS · BEATS", false)] {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(bank_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
+                        ui.label(RichText::new(title).size(9.0).color(MUTED));
+                        let enabled = deck.track.is_some() && (hotcues || audio.stream.is_some());
+                        for row in 0..2 {
+                            ui.horizontal(|ui| {
+                                for slot in row * 4..row * 4 + 4 {
+                                    let (beats, loop_label) = LOOP_PRESETS[slot];
+                                    let saved = deck.hotcues[slot].is_some();
+                                    let (label, selected, hint) = if hotcues {
+                                        ((slot + 1).to_string(), saved,
+                                         "Empty: set. Assigned: jump. Shift-click or right-click to clear.")
+                                    } else {
+                                        (loop_label.to_owned(), deck.loop_auto
+                                            && (deck.loop_active || deck.loop_pending())
+                                            && (deck.loop_beats - beats).abs() < 0.001,
+                                         "Start the beat loop. Press again to exit.")
+                                    };
+                                    let button = ui.add_enabled(
+                                        enabled,
+                                        egui::Button::new(label).small().selected(selected)
+                                            .min_size(Vec2::new(pad_width, 17.0)),
+                                    ).on_hover_text(hint);
+                                    if hotcues {
+                                        if button.secondary_clicked()
+                                            || (button.clicked() && ui.input(|i| i.modifiers.shift))
+                                        {
+                                            deck.clear_hotcue(slot);
+                                        } else if button.clicked() {
+                                            deck.hotcue(slot, audio);
+                                            changed |= saved;
+                                        }
+                                    } else if button.clicked() {
+                                        deck.beat_loop(beats, audio);
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+            }
+            changed
+        }).inner
+    }).inner
+}
+
 fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
     ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.spacing_mut().button_padding = Vec2::new(4.0, 2.0);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.spacing_mut().button_padding = Vec2::new(3.0, 1.0);
+        ui.spacing_mut().interact_size.y = 15.0;
         ui.label(RichText::new(label).size(9.0).color(MUTED));
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(28.0, 22.0), Sense::click_and_drag());
+            ui.allocate_exact_size(Vec2::new(24.0, 16.0), Sense::click_and_drag());
         if response.dragged() {
             *value = (*value - response.drag_delta().y * 0.2 + response.drag_delta().x * 0.1)
                 .clamp(-24.0, 12.0);
@@ -2863,13 +2944,13 @@ fn knob_ui(ui: &mut egui::Ui, label: &str, value: &mut f32, color: Color32) {
             } else {
                 *value / 12.0
             } * 2.3;
-        ui.painter().circle_filled(center, 10.0, BG);
+        ui.painter().circle_filled(center, 7.0, BG);
         ui.painter()
-            .circle_stroke(center, 10.0, Stroke::new(1.0_f32, BORDER));
+            .circle_stroke(center, 7.0, Stroke::new(1.0_f32, BORDER));
         ui.painter().line_segment(
             [
                 center + Vec2::angled(angle) * 3.0,
-                center + Vec2::angled(angle) * 8.0,
+                center + Vec2::angled(angle) * 6.0,
             ],
             Stroke::new(2.0_f32, color),
         );
@@ -2887,7 +2968,7 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
     ui.vertical_centered(|ui| {
         ui.visuals_mut().selection.bg_fill = color.gamma_multiply(0.35);
         ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, color);
-        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+        ui.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
         ui.label(RichText::new((index + 1).to_string()).strong().color(color));
         ui.columns(2, |columns| {
             for (band, label) in [(2, "HIGH"), (1, "MID"), (0, "LOW")] {
@@ -2895,11 +2976,11 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
             }
             knob_ui(&mut columns[1], "GAIN", &mut deck.gain, color);
             columns[1].vertical_centered(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
+                ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().slider_width = 64.0;
+                    ui.spacing_mut().slider_width = 48.0;
                     ui.add_sized(
-                        [18.0, 64.0],
+                        [18.0, 48.0],
                         egui::Slider::new(&mut deck.volume, 0.0..=1.0)
                             .vertical()
                             .show_value(false),
@@ -2928,12 +3009,12 @@ fn channel_strip(ui: &mut egui::Ui, deck: &mut Deck, color: Color32, index: usiz
 }
 
 fn strip_meter_ui(ui: &mut egui::Ui, level: f32, color: Color32) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, 64.0), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, 48.0), Sense::hover());
     response.on_hover_text(format!("Channel level: {}", peak_text(level)));
     let db = peak_db(level);
-    for segment in 0..30 {
-        let threshold = -60.0 + segment as f32 / 29.0 * 66.0;
-        let bottom = rect.bottom() - segment as f32 * rect.height() / 30.0;
+    for segment in 0..24 {
+        let threshold = -60.0 + segment as f32 / 23.0 * 66.0;
+        let bottom = rect.bottom() - segment as f32 * rect.height() / 24.0;
         let tint = if db < threshold {
             BORDER.gamma_multiply(0.45)
         } else if threshold >= 0.0 {
@@ -2945,8 +3026,8 @@ fn strip_meter_ui(ui: &mut egui::Ui, level: f32, color: Color32) {
         };
         ui.painter().rect_filled(
             Rect::from_min_size(
-                Pos2::new(rect.left(), bottom - rect.height() / 30.0 + 1.0),
-                Vec2::new(rect.width(), rect.height() / 30.0 - 1.0),
+                Pos2::new(rect.left(), bottom - rect.height() / 24.0 + 1.0),
+                Vec2::new(rect.width(), rect.height() / 24.0 - 1.0),
             ),
             1.0,
             tint,
@@ -3461,8 +3542,8 @@ fn stereo_meter_ui(ui: &mut egui::Ui, levels: [f32; 2], label: &str, color: Colo
         ui.set_width(102.0);
         ui.label(RichText::new(label).strong().color(color));
         ui.horizontal_top(|ui| {
-            meter_ui(ui, levels[0], color, "L", 104.0);
-            meter_ui(ui, levels[1], color, "R", 104.0);
+            meter_ui(ui, levels[0], color, "L", 74.0);
+            meter_ui(ui, levels[1], color, "R", 74.0);
         });
     });
 }

@@ -1068,6 +1068,7 @@ mod tests {
         Track {
             path: PathBuf::new(),
             title: "Jog test".into(),
+            tags: None,
             duration: Duration::from_secs(60),
             waveform: Vec::new(),
             sample_rate: 48000,

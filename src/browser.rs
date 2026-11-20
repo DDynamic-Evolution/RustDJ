@@ -1,6 +1,6 @@
 use crate::{
     analysis::{self, Job},
-    database::{self, Database, Fingerprint, Lookup, Summary},
+    database::{self, CollectionTrack, Database, Fingerprint, Lookup, Summary},
     dragdrop::{self, Origin},
     playlist::Item,
     track,
@@ -11,9 +11,11 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
 
 const FILE_ROW_HEIGHT: f32 = 22.0;
+const COLLECTION_PAGE: usize = 1000;
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -60,6 +62,23 @@ enum Sort {
     Duration,
 }
 
+type SearchResult = Result<Vec<CollectionTrack>, String>;
+
+#[derive(Default)]
+struct Collection {
+    open: bool,
+    entries: Vec<Entry>,
+    search_due: Option<Instant>,
+    revision: u64,
+    pending: Option<(u64, Receiver<SearchResult>)>,
+    limit: usize,
+    more: bool,
+    error: Option<String>,
+    backfill_started: bool,
+    backfill: Option<Receiver<()>>,
+    confirm_clear: bool,
+}
+
 pub struct Browser {
     pub settings: BrowserSettings,
     pub dirty: bool,
@@ -69,6 +88,7 @@ pub struct Browser {
     filtered: Vec<usize>,
     path_edit: String,
     search: String,
+    collection: Collection,
     receiver: Option<Receiver<Result<Listing, String>>>,
     database: PathBuf,
     database_error: Option<String>,
@@ -86,6 +106,7 @@ pub struct Browser {
 pub enum Event {
     Load(usize, PathBuf),
     Playlist(PathBuf),
+    AutoDj(PathBuf),
 }
 
 pub fn scan(path: &Path) -> Result<Vec<Entry>, String> {
@@ -182,6 +203,7 @@ impl Browser {
             filtered: Vec::new(),
             path_edit: String::new(),
             search: String::new(),
+            collection: Collection::default(),
             receiver: None,
             database: database::default_path(),
             database_error: None,
@@ -208,6 +230,8 @@ impl Browser {
         };
         let path = std::path::absolute(&path).unwrap_or(path);
         self.settings.folder = path.clone();
+        self.collection.open = false;
+        self.search.clear();
         self.path_edit = path.to_string_lossy().into_owned();
         self.selected = None;
         self.entries.clear();
@@ -237,7 +261,9 @@ impl Browser {
                         Ok(listing) => {
                             self.entries = listing.entries;
                             self.database_error = listing.database_error;
-                            self.refilter();
+                            if !self.collection.open {
+                                self.refilter();
+                            }
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -251,30 +277,27 @@ impl Browser {
         }
     }
 
+    fn display_entries(&self) -> &[Entry] {
+        if self.collection.open {
+            &self.collection.entries
+        } else {
+            &self.entries
+        }
+    }
+
+    fn selected_entry(&self) -> Option<&Entry> {
+        self.display_entries()
+            .get(*self.filtered.get(self.selected?)?)
+    }
+
     fn refilter(&mut self) {
-        let selected = self
-            .selected
-            .and_then(|row| self.filtered.get(row))
-            .and_then(|i| self.entries.get(*i))
-            .map(|e| e.path.clone());
-        let search = self.search.to_lowercase();
-        self.filtered = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                e.name.to_lowercase().contains(&search)
-                    || e.analysis.as_ref().is_some_and(|a| {
-                        a.key
-                            .is_some_and(|k| k.label().to_lowercase().contains(&search))
-                    })
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let selected = self.selected_entry().map(|entry| entry.path.clone());
+        let entries = self.display_entries();
+        let mut filtered: Vec<_> = (0..entries.len()).collect();
         let descending = self.descending;
-        self.filtered.sort_by(|left, right| {
-            let a = &self.entries[*left];
-            let b = &self.entries[*right];
+        filtered.sort_by(|left, right| {
+            let a = &entries[*left];
+            let b = &entries[*right];
             b.directory
                 .cmp(&a.directory)
                 .then_with(|| match self.sort {
@@ -312,11 +335,206 @@ impl Browser {
                 })
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        self.selected = selected.and_then(|path| {
-            self.filtered
-                .iter()
-                .position(|i| self.entries[*i].path == path)
+        self.selected =
+            selected.and_then(|path| filtered.iter().position(|i| entries[*i].path == path));
+        self.filtered = filtered;
+    }
+
+    fn refresh_collection(&mut self) {
+        self.collection
+            .search_due
+            .get_or_insert_with(|| Instant::now() + Duration::from_millis(120));
+    }
+
+    fn open_collection(&mut self) {
+        self.collection.open = true;
+        self.collection.entries.clear();
+        self.collection.error = None;
+        self.collection.more = false;
+        self.collection.limit = COLLECTION_PAGE;
+        self.collection.revision = self.collection.revision.wrapping_add(1);
+        self.collection.search_due = Some(Instant::now() + Duration::from_millis(120));
+        self.selected = None;
+        self.filtered.clear();
+
+        if !self.collection.backfill_started {
+            self.collection.backfill_started = true;
+            let (send, recv) = mpsc::channel();
+            let database = self.database.clone();
+            std::thread::spawn(move || {
+                if let Ok(db) = Database::open(&database)
+                    && let Ok(paths) = db.untagged_paths()
+                {
+                    for (path, identity) in paths {
+                        if Fingerprint::read(&path).ok().as_ref() != Some(&identity) {
+                            continue;
+                        }
+                        let tags = track::read_tags(&path);
+                        if Fingerprint::read(&path).ok().as_ref() == Some(&identity) {
+                            let _ = db.save_tags(&path, &identity, &tags);
+                        }
+                    }
+                }
+                let _ = send.send(());
+            });
+            self.collection.backfill = Some(recv);
+        }
+    }
+
+    fn show_folder(&mut self) {
+        self.collection.open = false;
+        self.search.clear();
+        self.selected = None;
+        self.refilter();
+    }
+
+    pub fn confirmation_open(&self) -> bool {
+        self.collection.confirm_clear
+    }
+
+    fn can_clear_collection(&self, deck_loading: bool) -> bool {
+        !deck_loading && self.job.is_none() && self.receiver.is_none()
+    }
+
+    fn confirm_clear(&mut self, ctx: &egui::Context, ready: bool) {
+        if !self.collection.confirm_clear {
+            return;
+        }
+        let (mut cancel, mut clear) = (false, false);
+        let dialog = egui::Modal::new(egui::Id::new("clear-music-collection")).show(ctx, |ui| {
+            ui.set_width(365.0);
+            ui.heading("Clear the music collection?");
+            ui.label("This removes all indexed tracks, cached tags, BPM, keys and waveforms from the collection.");
+            ui.label("Your audio files, playlists, hotcues, manual beatgrids and set history are kept.");
+            ui.horizontal(|ui| {
+                cancel = ui.button("Cancel").clicked();
+                clear = ui.add_enabled(
+                    ready,
+                    egui::Button::new(RichText::new("Clear collection").color(egui::Color32::LIGHT_RED)),
+                ).on_disabled_hover_text("Wait for the current scan or deck load to finish.")
+                    .clicked();
+            });
         });
+        if clear {
+            match Database::open(&self.database).and_then(|mut db| db.clear_collection()) {
+                Ok(removed) => {
+                    for entry in &mut self.entries {
+                        entry.analysis = None;
+                        entry.stale = false;
+                        entry.analysis_error = None;
+                    }
+                    self.collection.pending = None;
+                    self.search.clear();
+                    self.open_collection();
+                    self.database_error = None;
+                    self.analysis_details.clear();
+                    self.analysis_notice =
+                        Some(format!("Collection cleared ({removed} tracks removed)."));
+                }
+                Err(error) => self.database_error = Some(error),
+            }
+        }
+        if clear || cancel || dialog.should_close() {
+            self.collection.confirm_clear = false;
+        }
+    }
+
+    fn poll_collection(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.collection.backfill
+            && !matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty))
+        {
+            self.collection.backfill = None;
+            self.refresh_collection();
+        }
+        if let Some((revision, receiver)) = &self.collection.pending {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Collection search stopped.".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let current = self.collection.open && *revision == self.collection.revision;
+                self.collection.pending = None;
+                if current {
+                    match result {
+                        Ok(mut tracks) => {
+                            self.collection.error = None;
+                            self.collection.more = tracks.len() > self.collection.limit;
+                            tracks.truncate(self.collection.limit);
+                            let previous = self.selected_entry().map(|entry| entry.path.clone());
+                            self.collection.entries = tracks
+                                .into_iter()
+                                .map(|track| {
+                                    let filename = track
+                                        .path
+                                        .file_name()
+                                        .unwrap_or(track.path.as_os_str())
+                                        .to_string_lossy();
+                                    let name = match &track.summary.tags {
+                                        Some(tags) => {
+                                            let title = if tags.title.is_empty() {
+                                                filename.as_ref()
+                                            } else {
+                                                &tags.title
+                                            };
+                                            if tags.artist.is_empty() {
+                                                title.to_owned()
+                                            } else {
+                                                format!("{} · {title}", tags.artist)
+                                            }
+                                        }
+                                        None => filename.into_owned(),
+                                    };
+                                    Entry {
+                                        path: track.path,
+                                        name,
+                                        directory: false,
+                                        bytes: track.bytes,
+                                        analysis: Some(track.summary),
+                                        stale: track.stale,
+                                        analysis_error: None,
+                                        identity: None,
+                                    }
+                                })
+                                .collect();
+                            self.selected = None;
+                            self.refilter();
+                            self.selected = previous.and_then(|path| {
+                                self.filtered
+                                    .iter()
+                                    .position(|&index| self.collection.entries[index].path == path)
+                            });
+                        }
+                        Err(error) => self.collection.error = Some(error),
+                    }
+                }
+            }
+        }
+        if self.collection.open
+            && self.collection.pending.is_none()
+            && let Some(due) = self.collection.search_due
+        {
+            let now = Instant::now();
+            if due > now {
+                ctx.request_repaint_after(due - now);
+                return;
+            }
+            self.collection.search_due = None;
+            let (send, recv) = mpsc::channel();
+            let database = self.database.clone();
+            let query = self.search.clone();
+            let limit = self.collection.limit + 1;
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    Database::open(&database).and_then(|db| db.search_collection(&query, limit));
+                let _ = send.send(result);
+                ctx.request_repaint();
+            });
+            self.collection.pending = Some((self.collection.revision, recv));
+        }
     }
 
     pub fn on_track(&mut self, track: &track::Track) {
@@ -328,7 +546,22 @@ impl Browser {
             entry.analysis = Some(Summary::from_track(track));
             entry.stale = false;
             entry.analysis_error = track.cache_warning.clone();
-            self.refilter();
+            if !self.collection.open {
+                self.refilter();
+            }
+        }
+        self.refresh_collection();
+    }
+
+    fn start_folder_scan(&mut self, folder: PathBuf, ctx: &egui::Context) {
+        if self.job.is_some() {
+            return;
+        }
+        self.analysis_notice = None;
+        self.analysis_details.clear();
+        self.job = Some(Job::start_folder(folder, &self.database, ctx));
+        if !self.collection.open {
+            self.open_collection();
         }
     }
 
@@ -349,11 +582,22 @@ impl Browser {
             .map_or(Vec::new(), |job| job.receiver.try_iter().collect());
         let mut finished = false;
         let mut changed = false;
+        let mut collection_changed = false;
         for event in events {
             let Some(job) = &mut self.job else {
                 break;
             };
             match event {
+                analysis::Event::Discovered {
+                    total,
+                    errors,
+                    failures,
+                } => {
+                    job.total = total;
+                    job.discovering = false;
+                    job.failures += failures;
+                    job.errors.extend(errors);
+                }
                 analysis::Event::Started(path) => job.current = Some(path),
                 analysis::Event::Completed {
                     path,
@@ -366,6 +610,7 @@ impl Browser {
                     self.queued.remove(&path);
                     match result {
                         Ok(summary) => {
+                            collection_changed = true;
                             if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
                                 entry.analysis = Some(summary);
                                 entry.stale = false;
@@ -375,7 +620,9 @@ impl Browser {
                         }
                         Err(error) => {
                             job.failures += 1;
-                            job.errors.push(format!("{}: {error}", path.display()));
+                            if job.errors.len() < 30 {
+                                job.errors.push(format!("{}: {error}", path.display()));
+                            }
                             if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
                                 entry.analysis_error = Some(error);
                             }
@@ -404,8 +651,11 @@ impl Browser {
                 }
             }
         }
-        if changed {
+        if changed && !self.collection.open {
             self.refilter();
+        }
+        if collection_changed || finished {
+            self.refresh_collection();
         }
         if finished {
             self.job = None;
@@ -414,7 +664,7 @@ impl Browser {
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
-        let entry = self.entries.get(*self.filtered.get(self.selected?)?)?;
+        let entry = self.selected_entry()?;
         (!entry.directory).then(|| entry.path.clone())
     }
 
@@ -437,7 +687,7 @@ impl Browser {
     }
 
     pub fn activate(&mut self, deck: usize, ctx: &egui::Context) -> Option<Event> {
-        let entry = self.entries.get(*self.filtered.get(self.selected?)?)?;
+        let entry = self.selected_entry()?;
         let path = entry.path.clone();
         if entry.directory {
             self.navigate(path, ctx);
@@ -453,8 +703,11 @@ impl Browser {
         active: usize,
         deck_order: &[usize],
         ctx: &egui::Context,
+        deck_loading: bool,
     ) -> Option<Event> {
         self.poll();
+        self.poll_collection(ctx);
+        let mut folder_scan = None;
         let mut navigation = None;
         let mut event = None;
         ui.horizontal(|ui| {
@@ -476,14 +729,33 @@ impl Browser {
                 navigation = Some(self.settings.folder.clone());
             }
             if ui
+                .selectable_label(self.collection.open, "Collection")
+                .clicked()
+            {
+                if self.collection.open {
+                    self.show_folder();
+                } else {
+                    self.open_collection();
+                }
+            }
+            if ui
                 .add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search music / folders …")
-                        .desired_width(220.0),
+                        .hint_text("Search collection …")
+                        .desired_width((ui.available_width() - 220.0).clamp(100.0, 240.0)),
+                )
+                .on_hover_text(
+                    "Search filenames, paths and embedded tags. All entered words must match.",
                 )
                 .changed()
             {
-                self.refilter();
+                self.open_collection();
+            }
+            if !self.search.is_empty()
+                && ui.small_button("×").on_hover_text("Clear search").clicked()
+            {
+                self.search.clear();
+                self.open_collection();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -531,11 +803,9 @@ impl Browser {
             }
             ui.separator();
             let selected = self.selected_path();
-            let ready = selected.as_ref().is_some_and(|path| {
-                self.entries
-                    .iter()
-                    .any(|e| &e.path == path && e.analysis.is_some())
-            });
+            let ready = self
+                .selected_entry()
+                .is_some_and(|entry| entry.analysis.is_some() && !entry.stale);
             if ui
                 .add_enabled(
                     self.job.is_none() && selected.is_some(),
@@ -549,23 +819,36 @@ impl Browser {
             {
                 self.start_analysis(vec![selected.unwrap()], ready, ctx);
             }
-            let missing: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|e| !e.directory && e.analysis.is_none())
-                .map(|e| e.path.clone())
-                .collect();
-            if ui
-                .add_enabled(
-                    self.job.is_none() && !missing.is_empty(),
-                    egui::Button::new(format!("Analyze missing ({})", missing.len())),
-                )
-                .on_hover_text(
-                    "Analyze new or changed files in the current folder; excludes subfolders",
-                )
-                .clicked()
-            {
-                self.start_analysis(missing, false, ctx);
+            if self.collection.open {
+                let can_clear = self.can_clear_collection(deck_loading);
+                if ui
+                    .add_enabled(can_clear, egui::Button::new("Clear collection …"))
+                    .on_disabled_hover_text("Wait for the current scan or deck load to finish.")
+                    .clicked()
+                {
+                    self.collection.confirm_clear = true;
+                }
+                if self.collection.more && ui.button("More results").clicked() {
+                    self.collection.limit += COLLECTION_PAGE;
+                    self.refresh_collection();
+                }
+            } else {
+                let missing: Vec<_> = self
+                    .entries
+                    .iter()
+                    .filter(|e| !e.directory && e.analysis.is_none())
+                    .map(|e| e.path.clone())
+                    .collect();
+                if ui
+                    .add_enabled(
+                        self.job.is_none() && !missing.is_empty(),
+                        egui::Button::new(format!("Analyze missing ({})", missing.len())),
+                    )
+                    .on_hover_text("Analyze new or changed files in the current folder.")
+                    .clicked()
+                {
+                    self.start_analysis(missing, false, ctx);
+                }
             }
         });
         if let Some(job) = &self.job {
@@ -580,6 +863,8 @@ impl Browser {
                 }
                 let status = if job.cancelling() {
                     "Cancelling …".into()
+                } else if job.discovering {
+                    "Finding audio files …".into()
                 } else {
                     job.current.as_ref().map_or("Waiting …".into(), |p| {
                         p.file_name()
@@ -616,20 +901,11 @@ impl Browser {
                             let mut remove = None;
                             for (index, folder) in self.settings.favorites.iter().enumerate() {
                                 ui.horizontal(|ui| {
-                                    let name = folder
-                                        .file_name()
-                                        .unwrap_or(folder.as_os_str())
-                                        .to_string_lossy();
-                                    if ui
-                                        .add_sized(
-                                            [117.0, 24.0],
-                                            egui::Button::new(name)
-                                                .selected(*folder == self.settings.folder)
-                                                .truncate(),
-                                        )
-                                        .on_hover_text(folder.display().to_string())
-                                        .clicked()
-                                    {
+                                    let name = folder.file_name().unwrap_or(folder.as_os_str()).to_string_lossy();
+                                    let button = ui.add_sized([117.0, 24.0], egui::Button::new(name)
+                                        .selected(*folder == self.settings.folder).truncate());
+                                    folder_menu(&button, folder, self.job.is_none(), &mut folder_scan);
+                                    if button.on_hover_text(folder.display().to_string()).clicked() {
                                         navigation = Some(folder.clone());
                                     }
                                     if ui.small_button("x").clicked() {
@@ -644,40 +920,30 @@ impl Browser {
                             ui.separator();
                             ui.label(RichText::new("DRIVES").small().strong());
                             for root in &self.drives {
-                                if ui.small_button(root.display().to_string()).clicked() {
+                                let button = ui.small_button(root.display().to_string());
+                                folder_menu(&button, root, self.job.is_none(), &mut folder_scan);
+                                if button.clicked() {
                                     navigation = Some(root.clone());
                                 }
                             }
                             ui.separator();
                             ui.label(RichText::new("FOLDERS").small().strong());
-                            let ancestors: Vec<_> = self.settings.folder.ancestors().collect();
-                            for (depth, folder) in ancestors.into_iter().rev().enumerate() {
-                                let name = folder
-                                    .file_name()
-                                    .unwrap_or(folder.as_os_str())
-                                    .to_string_lossy();
+                            for (depth, folder) in self.settings.folder.ancestors().collect::<Vec<_>>().into_iter().rev().enumerate() {
+                                let name = folder.file_name().unwrap_or(folder.as_os_str()).to_string_lossy();
                                 ui.horizontal(|ui| {
                                     ui.add_space((depth.min(5) * 7) as f32);
-                                    if ui
-                                        .add(
-                                            egui::Button::new(format!("- {name}"))
-                                                .selected(folder == self.settings.folder)
-                                                .truncate(),
-                                        )
-                                        .clicked()
-                                    {
+                                    let button = ui.add(egui::Button::new(format!("- {name}"))
+                                        .selected(folder == self.settings.folder).truncate());
+                                    folder_menu(&button, folder, self.job.is_none(), &mut folder_scan);
+                                    if button.clicked() {
                                         navigation = Some(folder.to_path_buf());
                                     }
                                 });
                             }
                             for entry in self.entries.iter().filter(|entry| entry.directory) {
-                                if ui
-                                    .add(
-                                        egui::Button::new(format!("  + {}", entry.name)).truncate(),
-                                    )
-                                    .on_hover_text(entry.path.display().to_string())
-                                    .clicked()
-                                {
+                                let button = ui.add(egui::Button::new(format!("  + {}", entry.name)).truncate());
+                                folder_menu(&button, &entry.path, self.job.is_none(), &mut folder_scan);
+                                if button.on_hover_text(entry.path.display().to_string()).clicked() {
                                     navigation = Some(entry.path.clone());
                                 }
                             }
@@ -697,17 +963,35 @@ impl Browser {
                     ui.add_sized([57.0, 18.0], egui::Label::new(RichText::new("SIZE").small()));
                     if let Some(sort) = sort { if self.sort == sort { self.descending = !self.descending; } else { self.sort = sort; self.descending = false; } self.refilter(); }
                 });
-                if self.receiver.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Reading folder …");
-                    });
-                }
-                if let Some(error) = &self.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                }
-                if self.filtered.is_empty() && self.receiver.is_none() && self.error.is_none() {
-                    ui.label("No matching music files or folders.");
+                if self.collection.open {
+                    if let Some(error) = &self.collection.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    } else if self.collection.search_due.is_some() || self.collection.pending.is_some() {
+                        if self.filtered.is_empty() {
+                            ui.label("Searching collection …");
+                        }
+                    } else if self.filtered.is_empty() {
+                        ui.label(if self.collection.backfill.is_some() {
+                            "Reading tags for existing tracks …"
+                        } else if self.search.is_empty() {
+                            "Add a folder to the collection from its right-click menu."
+                        } else {
+                            "No matching tracks in the collection."
+                        });
+                    }
+                } else {
+                    if self.receiver.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Reading folder …");
+                        });
+                    }
+                    if let Some(error) = &self.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    if self.filtered.is_empty() && self.receiver.is_none() && self.error.is_none() {
+                        ui.label("No music files or folders.");
+                    }
                 }
                 let mut activate = false;
                 ui.spacing_mut().item_spacing.y = 3.0;
@@ -725,7 +1009,7 @@ impl Browser {
                 }
                 scroll.show_rows(ui, FILE_ROW_HEIGHT, self.filtered.len(), |ui, range| {
                     for row in range {
-                        let entry = &self.entries[self.filtered[row]];
+                        let entry = &self.display_entries()[self.filtered[row]];
                         let row_response = ui.horizontal(|ui| {
                             let name = if entry.directory {
                                 format!("[Folder]  {}", entry.name)
@@ -766,7 +1050,7 @@ impl Browser {
                             ui.add_sized([100.0, FILE_ROW_HEIGHT], egui::Label::new(key.map_or("—".into(), |k| k.label())))
                                 .on_hover_text(key.map_or("No reliable key detected, or the file has not been analyzed yet.".into(), |k| format!("Estimated key: {}. Profile match {:.0}%; not guaranteed.", k.label(), k.confidence * 100.0)));
                             let working = self.job.as_ref().is_some_and(|job| job.current.as_ref() == Some(&entry.path));
-                            let state = if entry.directory { "" } else if working { "Analyzing …" } else if self.queued.contains(&entry.path) { "Queued" } else if entry.analysis_error.is_some() { "Error" } else if summary.is_some() { "Analyzed" } else if entry.stale { "Changed" } else { "Pending" };
+                            let state = if entry.directory { "" } else if working { "Analyzing …" } else if self.queued.contains(&entry.path) { "Queued" } else if entry.analysis_error.is_some() { "Error" } else if entry.stale { "Changed" } else if summary.is_some() { "Analyzed" } else { "Pending" };
                             ui.add_sized([78.0, FILE_ROW_HEIGHT], egui::Label::new(RichText::new(state).small().color(if entry.analysis_error.is_some() { egui::Color32::LIGHT_RED } else { ui.visuals().weak_text_color() }))).on_hover_text(entry.analysis_error.as_deref().unwrap_or(state));
                             ui.add_sized([48.0, FILE_ROW_HEIGHT], egui::Label::new(if entry.directory { "DIR".into() } else { entry.path.extension().unwrap_or_default().to_string_lossy().to_uppercase() }));
                             ui.add_sized([57.0, FILE_ROW_HEIGHT], egui::Label::new(if entry.directory { "".into() } else { format!("{:.1} MB", entry.bytes as f64 / 1_000_000.0) }));
@@ -775,14 +1059,33 @@ impl Browser {
                             row_response.response.rect.intersect(ui.clip_rect()),
                             ui.id().with(("music-row", &entry.path)),
                             if entry.directory { egui::Sense::click() } else { egui::Sense::click_and_drag() },
-                        ).on_hover_text(entry.path.display().to_string());
-                        if response.clicked() || response.drag_started() { self.selected = Some(row); }
-                        if response.double_clicked() { self.selected = Some(row); activate = true; }
+                        ).on_hover_ui(|ui| {
+                            ui.label(entry.path.display().to_string());
+                            if let Some(tags) = entry.analysis.as_ref().and_then(|summary| summary.tags.as_ref()) {
+                                for (label, value) in [("Title", &tags.title), ("Artist", &tags.artist),
+                                    ("Album", &tags.album), ("Genre", &tags.genre)] {
+                                    if !value.is_empty() {
+                                        ui.label(format!("{label} · {value}"));
+                                    }
+                                }
+                            }
+                        });
                         if !entry.directory {
                             let mut item = Item::new(entry.path.clone(), None);
-                            item.summary = entry.analysis.clone(); item.available = Some(true);
+                            item.summary = entry.analysis.clone();
+                            item.available = Some(true);
                             dragdrop::source(&response, item, Origin::Browser);
+                            response.context_menu(|ui| {
+                                if ui.button("Add to AutoDJ").clicked() {
+                                    event = Some(Event::AutoDj(entry.path.clone()));
+                                    ui.close();
+                                }
+                            });
+                        } else {
+                            folder_menu(&response, &entry.path, self.job.is_none(), &mut folder_scan);
                         }
+                        if response.clicked() || response.drag_started() { self.selected = Some(row); }
+                        if response.double_clicked() { self.selected = Some(row); activate = true; }
                     }
                 });
                 if activate {
@@ -793,8 +1096,30 @@ impl Browser {
         if let Some(path) = navigation {
             self.navigate(path, ctx);
         }
+        if let Some(folder) = folder_scan {
+            self.start_folder_scan(folder, ctx);
+        }
+        let can_clear = self.can_clear_collection(deck_loading) && event.is_none();
+        self.confirm_clear(ctx, can_clear);
         event
     }
+}
+
+fn folder_menu(
+    response: &egui::Response,
+    path: &Path,
+    enabled: bool,
+    request: &mut Option<PathBuf>,
+) {
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(enabled, egui::Button::new("Add to collection and scan"))
+            .clicked()
+        {
+            *request = Some(path.to_path_buf());
+            ui.close();
+        }
+    });
 }
 
 #[cfg(test)]

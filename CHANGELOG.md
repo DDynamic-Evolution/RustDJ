@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.24.1
+
+- Added a saved AutoDJ playlist with automatic playback in order through the master mix, plus start, stop and skip controls.
+- Added a confirmation dialog for clearing indexed tracks and cached analyses from the music collection while keeping music files and saved performance data.
+
+## 0.24.0
+
+- Added live collection search across known paths and embedded audio tags.
+- Added a right-click command to add folders and scan tags, BPM and key recursively in the background.
+- Existing analyses appear in the collection and receive missing tag data in the background.
+
+## 0.23.9
+
+- Moved the hotcue and beat-loop banks next to the filter and effects on each deck.
+- Reduced mixer height to leave more room for the music browser in both deck layouts.
+
 ## 0.23.8
 
 This entry covers the changes on `main` since the [0.23.1 tag](https://github.com/DDynamic-Evolution/RustDJ/releases/tag/v0.23.1).

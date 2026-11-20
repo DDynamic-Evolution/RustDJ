@@ -24,9 +24,10 @@ pub fn cached(
     }
     let before = Fingerprint::read(&path)?;
     if !force
-        && let Some(track) = db.load_track(&path, &before)?
+        && let Some(mut track) = db.load_track(&path, &before)?
         && Fingerprint::read(&path)? == before
     {
+        fill_tags(db, &mut track, &before)?;
         return Ok(track);
     }
     let track = track::analyze(path.clone(), cancelled)?;
@@ -40,6 +41,18 @@ pub fn cached(
     Ok(track)
 }
 
+fn fill_tags(db: &Database, track: &mut Track, identity: &Fingerprint) -> Result<(), String> {
+    if track.tags.is_none() {
+        let tags = track::read_tags(&track.path);
+        if &Fingerprint::read(&track.path)? != identity {
+            return Err("The file changed while reading its tags.".into());
+        }
+        db.save_tags(&track.path, identity, &tags)?;
+        track.tags = Some(tags);
+    }
+    Ok(())
+}
+
 /// A missing/unwritable database must not prevent audio playback.
 pub fn load(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     let before = Fingerprint::read(&path)?;
@@ -49,9 +62,12 @@ pub fn load(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     };
     if let Some(db) = &db {
         match db.load_track(&path, &before) {
-            Ok(Some(track))
+            Ok(Some(mut track))
                 if !cancelled.load(Ordering::Relaxed) && Fingerprint::read(&path)? == before =>
             {
+                if let Err(error) = fill_tags(db, &mut track, &before) {
+                    track.cache_warning = Some(format!("Tags were not saved: {error}"));
+                }
                 return Ok(track);
             }
             Ok(_) => {}
@@ -74,7 +90,39 @@ pub fn load(path: PathBuf, cancelled: &AtomicBool) -> Result<Track, String> {
     Ok(track)
 }
 
+fn analyze_summary(
+    db: &Database,
+    path: &Path,
+    cancelled: &AtomicBool,
+    force: bool,
+) -> Result<(Summary, bool), String> {
+    if !force {
+        let identity = Fingerprint::read(path)?;
+        if let database::Lookup::Fresh(mut summary) = db.lookup(path, &identity)? {
+            if summary.tags.is_none() {
+                let tags = track::read_tags(path);
+                if Fingerprint::read(path)? != identity {
+                    return Err("The file changed while reading its tags.".into());
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("Analysis cancelled.".into());
+                }
+                db.save_tags(path, &identity, &tags)?;
+                summary.tags = Some(tags);
+            }
+            return Ok((summary, true));
+        }
+    }
+    cached(db, path.to_path_buf(), cancelled, force)
+        .map(|track| (Summary::from_track(&track), track.from_cache))
+}
+
 pub enum Event {
+    Discovered {
+        total: usize,
+        errors: Vec<String>,
+        failures: usize,
+    },
     Started(PathBuf),
     Completed {
         path: PathBuf,
@@ -90,6 +138,7 @@ pub enum Event {
 pub struct Job {
     pub receiver: Receiver<Event>,
     pub total: usize,
+    pub discovering: bool,
     pub completed: usize,
     pub reused: usize,
     pub failures: usize,
@@ -97,6 +146,59 @@ pub struct Job {
     pub errors: Vec<String>,
     cancelled: Arc<AtomicBool>,
 }
+enum Batch {
+    Files(Vec<PathBuf>, bool),
+    Folder(PathBuf),
+}
+
+fn discover(folder: PathBuf, cancelled: &AtomicBool) -> (Vec<PathBuf>, Vec<String>, usize) {
+    let mut files = Vec::new();
+    let mut directories = vec![folder];
+    let mut errors = Vec::new();
+    let mut failures = 0;
+    let mut record_error = |path: &Path, error: std::io::Error| {
+        failures += 1;
+        if errors.len() < 30 {
+            errors.push(format!("{}: {error}", path.display()));
+        }
+    };
+    while let Some(path) = directories.pop() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let listing = match std::fs::read_dir(&path) {
+            Ok(listing) => listing,
+            Err(error) => {
+                record_error(&path, error);
+                continue;
+            }
+        };
+        for entry in listing {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    record_error(&path, error);
+                    continue;
+                }
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => directories.push(entry.path()),
+                // Skip symlinks inside the tree, including links back to an ancestor.
+                Ok(kind) if kind.is_file() && track::supported(&entry.path()) => {
+                    files.push(entry.path())
+                }
+                Ok(_) => {}
+                Err(error) => record_error(&entry.path(), error),
+            }
+        }
+    }
+    files.sort();
+    (files, errors, failures)
+}
+
 impl Job {
     pub fn start(paths: Vec<PathBuf>, force: bool, database: &Path, ctx: &egui::Context) -> Self {
         let mut seen = HashSet::new();
@@ -104,7 +206,18 @@ impl Job {
             .into_iter()
             .filter(|p| seen.insert(p.clone()))
             .collect();
-        let total = paths.len();
+        Self::launch(Batch::Files(paths, force), database, ctx)
+    }
+
+    pub fn start_folder(path: PathBuf, database: &Path, ctx: &egui::Context) -> Self {
+        Self::launch(Batch::Folder(path), database, ctx)
+    }
+
+    fn launch(batch: Batch, database: &Path, ctx: &egui::Context) -> Self {
+        let (total, discovering) = match &batch {
+            Batch::Files(paths, _) => (paths.len(), false),
+            Batch::Folder(_) => (0, true),
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancelled.clone();
         let database = database.to_path_buf();
@@ -119,6 +232,25 @@ impl Job {
                     return;
                 }
             };
+            let (paths, force) = match batch {
+                Batch::Files(paths, force) => (paths, force),
+                Batch::Folder(folder) => {
+                    let root = std::fs::canonicalize(&folder).unwrap_or(folder);
+                    let (paths, errors, failures) = discover(root, &worker_cancel);
+                    if sender
+                        .send(Event::Discovered {
+                            total: paths.len(),
+                            errors,
+                            failures,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                    (paths, false)
+                }
+            };
             for path in paths {
                 if worker_cancel.load(Ordering::Relaxed) {
                     break;
@@ -127,12 +259,12 @@ impl Job {
                     return;
                 }
                 ctx.request_repaint();
-                let result = cached(&db, path.clone(), &worker_cancel, force);
+                let result = analyze_summary(&db, &path, &worker_cancel, force);
                 if worker_cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let reused = result.as_ref().is_ok_and(|t| t.from_cache);
-                let result = result.map(|t| Summary::from_track(&t));
+                let reused = result.as_ref().is_ok_and(|(_, reused)| *reused);
+                let result = result.map(|(summary, _)| summary);
                 if sender
                     .send(Event::Completed {
                         path,
@@ -153,6 +285,7 @@ impl Job {
         Self {
             receiver,
             total,
+            discovering,
             completed: 0,
             reused: 0,
             failures: 0,
@@ -176,6 +309,77 @@ impl Drop for Job {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn collection_folder_scan_indexes_nested_file_tags_and_bpm() {
+        fn syncsafe(size: usize) -> [u8; 4] {
+            [21, 14, 7, 0].map(|shift| ((size >> shift) & 127) as u8)
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let folder = workspace.path().join("Music");
+        let nested = folder.join("Deep").join("House");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("fixture_01.mp3");
+        let source =
+            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/demo-a.mp3")).unwrap();
+        let source_start = if source.starts_with(b"ID3") {
+            10 + source[6..10]
+                .iter()
+                .fold(0, |size, byte| (size << 7) + usize::from(*byte))
+        } else {
+            0
+        };
+        let mut frames = Vec::new();
+        for (key, text) in [
+            (b"TIT2", "Moonlight Signal"),
+            (b"TPE1", "Nördliche Welle"),
+            (b"TCON", "Deep_Test"),
+        ] {
+            frames.extend_from_slice(key);
+            frames.extend_from_slice(&syncsafe(text.len() + 1));
+            frames.extend_from_slice(&[0, 0, 3]);
+            frames.extend_from_slice(text.as_bytes());
+        }
+        let mut file = b"ID3\x04\x00\x00".to_vec();
+        file.extend_from_slice(&syncsafe(frames.len()));
+        file.extend_from_slice(&frames);
+        file.extend_from_slice(&source[source_start..]);
+        std::fs::write(&path, file).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&folder, nested.join("Cycle")).unwrap();
+
+        let database = workspace.path().join("test.sqlite3");
+        let job = Job::start_folder(folder, &database, &egui::Context::default());
+        loop {
+            match job
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(12))
+                .unwrap()
+            {
+                Event::Discovered {
+                    total, failures, ..
+                } => {
+                    assert_eq!((total, failures), (1, 0));
+                }
+                Event::Completed { result, .. } => assert!(result.unwrap().bpm().is_some()),
+                Event::Finished { cancelled } => {
+                    assert!(!cancelled);
+                    break;
+                }
+                Event::Fatal(error) => panic!("{error}"),
+                Event::Started(_) => {}
+            }
+        }
+
+        let db = Database::open(&database).unwrap();
+        let tracks = db.search_collection("NÖRD signal DEEP_", 10).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].path, path);
+        assert!((tracks[0].summary.bpm().unwrap() - 120.0).abs() < 1.0);
+        assert_eq!(db.search_collection("ture_01", 10).unwrap().len(), 1);
+        assert!(db.search_collection("missing", 10).unwrap().is_empty());
+    }
+
     use super::*;
     #[test]
     fn cached_results_skip_decode_and_cancellation_never_writes_a_record() {
@@ -223,7 +427,7 @@ mod tests {
                     break;
                 }
                 Event::Fatal(error) => panic!("{error}"),
-                Event::Started(_) => {}
+                Event::Started(_) | Event::Discovered { .. } => {}
             }
         }
         assert_eq!(completed.len(), 2);

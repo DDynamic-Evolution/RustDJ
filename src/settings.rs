@@ -27,6 +27,7 @@ pub struct Settings {
     pub master_limiter: bool,
     pub jingles: crate::jingles::Settings,
     pub master_eq: crate::equalizer::Settings,
+    pub autodj: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.23.8
+# RustDJ 0.24.1
 
 RustDJ is a desktop DJ and broadcasting app for Windows and Linux. Mix with
 two or four decks, browse your music, and send the master mix to SHOUTcast
@@ -31,7 +31,7 @@ repository root, install the amd64 package and launch RustDJ from the
 application menu or run `rustdj`.
 
 ```bash
-sudo apt install ./outputs/rustdj_0.23.8_amd64.deb
+sudo apt install ./outputs/rustdj_0.24.1_amd64.deb
 ```
 
 The Linux build was tested on Linux Mint 22.3, which uses an Ubuntu 24.04
@@ -66,6 +66,10 @@ follow the same order:
 Deck 1   Deck 3   [ central mixer ]   Deck 4   Deck 2
 purple   pink                         turquoise yellow
 ```
+
+On each deck, the hotcue and beat-loop banks sit next to the filter and effects.
+The two banks sit side by side when the deck is wide enough and stack on narrower
+windows.
 
 Each mixer channel has **HIGH**, **MID** and **LOW** EQ controls stacked
 vertically. **GAIN**, the channel fader, its meter and headphone **CUE** sit
@@ -120,8 +124,22 @@ mixer and scrolling waveforms. The browser shows drives, folders and supported
 music files. Use **Up** to open
 the parent folder, **Go** to open a typed path, and **Favorite +** to bookmark the
 current folder. The last folder and favorites are saved between sessions.
-Double-click a folder to open it. Search filters the current folder without
-recursively scanning subfolders.
+Double-click a folder to open it. Type into **Search collection …** above
+the file list to find tracks across the library. Search matches parts of
+filenames, paths and embedded tags such as title, artist, album and genre.
+Multiple words must all match. Click **Collection** to browse indexed
+tracks or return to the current folder.
+
+Right-click a folder in the tree and choose **Add to collection and scan**.
+RustDJ includes nested folders and reads tags, BPM and key in the
+background. Previously analyzed tracks are already in the collection.
+RustDJ fills in missing tags in the background when the collection opens.
+Cancel a scan to stop the queue while keeping completed results.
+
+To empty the music database, open **Collection** and click
+**Clear collection …**. Confirm to remove all indexed entries and cached
+analyses. RustDJ keeps the source files, playlists, hotcues, manually corrected
+beatgrids and set history. Scanning a folder or loading a track indexes it again.
 
 RustDJ decodes MP3, FLAC, WAV, Ogg, M4A, AAC and AIFF. The file list shows
 duration, BPM, key, analysis state, format and size.
@@ -160,6 +178,14 @@ remote URLs are not supported.
 you organize entries. Playlists preserve order and allow repeated tracks.
 Missing files remain visible with a warning so their paths can be corrected.
 Relative paths, spaces and Unicode names are supported.
+
+The **AutoDJ** tab has its own saved playlist. Right-click a track in the
+browser and choose **Add to AutoDJ**, drag tracks onto the tab, or use
+**Add selection**, **Files …** and **Add playlist** to build the list.
+Select an entry to reorder or remove it while AutoDJ is stopped. **Start AutoDJ**
+plays the list from the beginning through the master mix. **Next** skips the
+current track and **Stop** ends playback. AutoDJ skips unavailable files and
+stops after the last track. Playback starts when you press **Start AutoDJ**.
 
 **SESSION / SIDELIST** contains tracks successfully loaded during this session,
 with each path listed once. Search filters the session list. The sidelist width
