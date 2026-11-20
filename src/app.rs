@@ -344,6 +344,21 @@ impl RustDj {
         }
     }
 
+    fn load_dropped_tracks(
+        &mut self,
+        first_deck: usize,
+        paths: impl IntoIterator<Item = PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        let order = self.deck_layout.order();
+        let slot = order.iter().position(|&deck| deck == first_deck).unwrap_or(0);
+        let targets = order.iter().cycle().skip(slot).take(order.len());
+        for (path, &target) in paths.into_iter().zip(targets) {
+            self.decks[target].load(path, ctx.clone());
+            self.active = target;
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() || self.browser.confirmation_open() {
             return;
@@ -2253,7 +2268,7 @@ impl eframe::App for RustDj {
                     let playlist = ui.selectable_value(tab, LibraryTab::Playlist, "PLAYLIST");
                     drops.add(DropTarget::Playlist(None), playlist.rect, ui.layer_id());
                     let autodj = ui.selectable_value(tab, LibraryTab::AutoDj, "AutoDJ");
-                    drops.add(DropTarget::AutoDj, autodj.rect, ui.layer_id());
+                    drops.add(DropTarget::AutoDj(None), autodj.rect, ui.layer_id());
                     if playlist.clicked() {
                         self.playlist.refresh(ctx);
                     }
@@ -2263,7 +2278,7 @@ impl eframe::App for RustDj {
                     match self.library_tab {
                         LibraryTab::Session => DropTarget::Session,
                         LibraryTab::Playlist => DropTarget::Playlist(None),
-                        LibraryTab::AutoDj => DropTarget::AutoDj,
+                        LibraryTab::AutoDj => DropTarget::AutoDj(None),
                     },
                     ui.available_rect_before_wrap(),
                     ui.layer_id(),
@@ -2285,8 +2300,9 @@ impl eframe::App for RustDj {
                             ctx,
                             &self.audio,
                             self.master * self.talkover.gain(),
-                            self.browser.selected_path(),
+                            self.browser.selected_paths(),
                             &self.playlist.items,
+                            &mut drops,
                         );
                     }
                 }
@@ -2303,12 +2319,12 @@ impl eframe::App for RustDj {
                         self.decks[index].load(path, ctx.clone());
                         self.active = index;
                     }
-                    Some(BrowserEvent::Playlist(path)) => {
-                        self.playlist.add(vec![path], ctx);
+                    Some(BrowserEvent::Playlist(paths)) => {
+                        self.playlist.add(paths, ctx);
                         self.library_tab = LibraryTab::Playlist;
                     }
-                    Some(BrowserEvent::AutoDj(path)) => {
-                        self.audio_dirty |= self.autodj.add([path]);
+                    Some(BrowserEvent::AutoDj(paths)) => {
+                        self.audio_dirty |= self.autodj.add(paths);
                         self.library_tab = LibraryTab::AutoDj;
                     }
                     None => {}
@@ -2328,23 +2344,28 @@ impl eframe::App for RustDj {
         if let Some((target, music)) = drops.finish(ctx) {
             match target {
                 DropTarget::Deck(index) => {
-                    self.decks[index].load(music.item.path, ctx.clone());
-                    self.active = index;
+                    self.load_dropped_tracks(index, music.items.into_iter().map(|item| item.path), ctx);
                 }
                 DropTarget::Session => {
-                    upsert_session(&mut self.library, music.item);
+                    for item in music.items {
+                        upsert_session(&mut self.library, item);
+                    }
                     self.library_tab = LibraryTab::Session;
                 }
                 DropTarget::Playlist(index) => {
-                    if let Origin::Playlist(source) = music.origin {
-                        self.playlist.move_to(source, index);
+                    if let Origin::Playlist(range) = music.origin {
+                        self.playlist.move_to(range, index);
                     } else {
-                        self.playlist.insert(music.item, index, ctx);
+                        self.playlist.insert_many(music.items, index, ctx);
                     }
                     self.library_tab = LibraryTab::Playlist;
                 }
-                DropTarget::AutoDj => {
-                    self.audio_dirty |= self.autodj.add([music.item.path]);
+                DropTarget::AutoDj(index) => {
+                    self.audio_dirty |= if let Origin::AutoDj(range) = music.origin {
+                        self.autodj.move_to(range, index)
+                    } else {
+                        self.autodj.insert(music.items.into_iter().map(|item| item.path).collect(), index)
+                    };
                     self.library_tab = LibraryTab::AutoDj;
                 }
             }
@@ -2365,14 +2386,7 @@ impl eframe::App for RustDj {
         if !external_music.is_empty() {
             match external_target {
                 Some(DropTarget::Deck(index)) => {
-                    let slot = deck_order.iter().position(|&deck| deck == index).unwrap_or(0);
-                    for (offset, path) in
-                        external_music.into_iter().take(deck_order.len()).enumerate()
-                    {
-                        let target = deck_order[(slot + offset) % deck_order.len()];
-                        self.decks[target].load(path, ctx.clone());
-                        self.active = target;
-                    }
+                    self.load_dropped_tracks(index, external_music, ctx);
                 }
                 Some(DropTarget::Session) => {
                     for path in external_music {
@@ -2391,8 +2405,8 @@ impl eframe::App for RustDj {
                     );
                     self.library_tab = LibraryTab::Playlist;
                 }
-                Some(DropTarget::AutoDj) => {
-                    self.audio_dirty |= self.autodj.add(external_music);
+                Some(DropTarget::AutoDj(index)) => {
+                    self.audio_dirty |= self.autodj.insert(external_music, index);
                     self.library_tab = LibraryTab::AutoDj;
                 }
                 None => {}

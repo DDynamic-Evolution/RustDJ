@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.3
+
+- Added Shift-click range selection and group drag-and-drop to the music browser, collection, regular playlist and AutoDJ playlist.
+
 ## 0.24.2
 
 - AutoDJ opens the first entry on Start and advances through the list independently of the interface. Stop cancels the current track and any pending load.

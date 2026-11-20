@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.24.2
+# RustDJ 0.24.3
 
 RustDJ is a desktop DJ and broadcasting app for Windows and Linux. Mix with
 two or four decks, browse your music, and send the master mix to SHOUTcast
@@ -31,7 +31,7 @@ repository root, install the amd64 package and launch RustDJ from the
 application menu or run `rustdj`.
 
 ```bash
-sudo apt install ./outputs/rustdj_0.24.2_amd64.deb
+sudo apt install ./outputs/rustdj_0.24.3_amd64.deb
 ```
 
 The Linux build was tested on Linux Mint 22.3, which uses an Ubuntu 24.04
@@ -197,6 +197,13 @@ onto **PLAYLIST** or **SESSION**, including their tabs, to add them to a list.
 An insertion line shows where a playlist item will be placed. Dragging within a
 playlist reorders it; dragging onto a deck loads it. Adding tracks to a list does
 not start playback or remove the original files. Escape cancels an active drag.
+
+In the browser, collection, **PLAYLIST** and **AutoDJ**, click a track and
+Shift-click another to select every track between them. Drag any highlighted
+track to move the entire selection in its displayed order. Within the same
+playlist the selection moves as a block. Stop AutoDJ to reorder its list.
+When dropping a selection on a deck, tracks fill the visible decks in order
+starting with the target.
 
 Files from the desktop file manager can also be dropped onto decks and lists. Dropping
 multiple files onto a deck loads up to four decks in display order, starting at

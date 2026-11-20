@@ -1,10 +1,13 @@
 use crate::{
+    dragdrop::{self, Music, Origin, Selection, Target, Zones},
     output::{Audio, ChannelPair},
+    playlist::Item,
     track,
 };
 use eframe::egui;
 use rodio::{Sink, mixer::Mixer};
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -48,7 +51,7 @@ struct Output {
 pub struct AutoDj {
     paths: Vec<PathBuf>,
     run: Option<Arc<Mutex<Run>>>,
-    selected: Option<usize>,
+    selection: Selection,
 }
 
 impl AutoDj {
@@ -56,7 +59,7 @@ impl AutoDj {
         Self {
             paths,
             run: None,
-            selected: None,
+            selection: Selection::default(),
         }
     }
 
@@ -79,6 +82,38 @@ impl AutoDj {
                 run.error = None;
             }
         }
+        true
+    }
+
+    fn running(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.lock().unwrap().playback.index().is_some())
+    }
+
+    pub fn insert(&mut self, paths: Vec<PathBuf>, before: Option<usize>) -> bool {
+        let Some(before) = before.filter(|_| !self.running()) else {
+            return self.add(paths);
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        let before = before.min(self.paths.len());
+        self.selection.select_range(before..before + paths.len());
+        self.paths.splice(before..before, paths);
+        self.run = None;
+        true
+    }
+
+    pub fn move_to(&mut self, range: Range<usize>, before: Option<usize>) -> bool {
+        if self.running() {
+            return false;
+        }
+        let Some(moved) = dragdrop::move_range(&mut self.paths, range, before) else {
+            return false;
+        };
+        self.selection.select_range(moved);
+        self.run = None;
         true
     }
 
@@ -165,8 +200,9 @@ impl AutoDj {
         ctx: &egui::Context,
         audio: &Audio,
         gain: f32,
-        browser_selection: Option<PathBuf>,
-        playlist: &[crate::playlist::Item],
+        browser_selection: Vec<PathBuf>,
+        playlist: &[Item],
+        drops: &mut Zones,
     ) -> bool {
         let (current, status, error) = self.status();
         let idle = current.is_none();
@@ -211,14 +247,13 @@ impl AutoDj {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    browser_selection.is_some(),
+                    !browser_selection.is_empty(),
                     egui::Button::new("Add selection"),
                 )
-                .on_hover_text("Add the selected track from the music browser.")
+                .on_hover_text("Add the selected tracks from the music browser.")
                 .clicked()
-                && let Some(path) = browser_selection
             {
-                changed |= self.add([path]);
+                changed |= self.add(browser_selection);
             }
             if ui.button("Files …").clicked()
                 && let Some(files) = rfd::FileDialog::new()
@@ -235,37 +270,41 @@ impl AutoDj {
                 changed |= self.add(playlist.iter().map(|item| item.path.clone()));
             }
         });
-        if let Some(index) = self.selected {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(idle && index > 0, egui::Button::new("Move up"))
-                    .clicked()
-                {
-                    self.paths.swap(index, index - 1);
-                    self.selected = Some(index - 1);
-                    self.run = None;
-                    changed = true;
-                }
-                if ui
-                    .add_enabled(
-                        idle && index + 1 < self.paths.len(),
-                        egui::Button::new("Move down"),
-                    )
-                    .clicked()
-                {
-                    self.paths.swap(index, index + 1);
-                    self.selected = Some(index + 1);
-                    self.run = None;
-                    changed = true;
-                }
-                if ui.add_enabled(idle, egui::Button::new("Remove")).clicked() {
-                    self.paths.remove(index);
-                    self.selected = None;
-                    self.run = None;
-                    changed = true;
-                }
-            });
-        }
+        let range = self.selection.range().filter(|_| idle);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    range.as_ref().is_some_and(|range| range.start > 0),
+                    egui::Button::new("Move up"),
+                )
+                .clicked()
+                && let Some(range) = &range
+            {
+                changed |= self.move_to(range.clone(), Some(range.start - 1));
+            }
+            if ui
+                .add_enabled(
+                    range
+                        .as_ref()
+                        .is_some_and(|range| range.end < self.paths.len()),
+                    egui::Button::new("Move down"),
+                )
+                .clicked()
+                && let Some(range) = &range
+            {
+                changed |= self.move_to(range.clone(), Some(range.end + 1));
+            }
+            if ui
+                .add_enabled(range.is_some(), egui::Button::new("Remove"))
+                .clicked()
+                && let Some(range) = range
+            {
+                self.paths.drain(range);
+                self.selection = Selection::default();
+                self.run = None;
+                changed = true;
+            }
+        });
         ui.separator();
         egui::ScrollArea::vertical().show_rows(ui, 22.0, self.paths.len(), |ui, rows| {
             for index in rows {
@@ -275,12 +314,36 @@ impl AutoDj {
                 } else {
                     egui::RichText::new(file_title(path))
                 };
-                if ui
-                    .add(egui::Button::selectable(self.selected == Some(index), title).truncate())
+                let response = ui
+                    .add_sized(
+                        [ui.available_width(), 22.0],
+                        egui::Button::selectable(self.selection.contains(index), title)
+                            .sense(egui::Sense::click_and_drag())
+                            .truncate(),
+                    )
                     .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    self.selected = Some(index);
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                let extend = ui.input(|input| input.modifiers.shift);
+                if response.clicked() {
+                    self.selection.click(index, extend);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    self.selection.start_drag(index, extend);
+                    let range = self.selection.range().unwrap();
+                    let items = self.paths[range.clone()]
+                        .iter()
+                        .map(|path| Item::new(path.clone(), None))
+                        .collect();
+                    dragdrop::source_many(
+                        &response,
+                        Music {
+                            items,
+                            origin: Origin::AutoDj(range),
+                        },
+                    );
+                }
+                if idle {
+                    drops.list_row(ui, response.rect, |at| Target::AutoDj(Some(at)), index);
                 }
             }
         });

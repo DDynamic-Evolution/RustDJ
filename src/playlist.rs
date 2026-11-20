@@ -1,6 +1,6 @@
 use crate::{
     database::{self, Database, Fingerprint, Lookup, Summary},
-    dragdrop::{self, Origin, Zones},
+    dragdrop::{self, Music, Origin, Selection, Target, Zones},
     track::{self, Track},
 };
 use eframe::egui::{self, RichText};
@@ -156,7 +156,7 @@ pub struct Playlist {
     pub items: Vec<Item>,
     pub modified: bool,
     pub path: Option<PathBuf>,
-    selected: Option<usize>,
+    selection: Selection,
     error: Option<String>,
     notice: Option<String>,
     metadata: Option<Receiver<Metadata>>,
@@ -165,16 +165,12 @@ pub struct Playlist {
 }
 
 impl Playlist {
-    pub fn insert(&mut self, item: Item, index: Option<usize>, ctx: &egui::Context) {
-        self.insert_many(vec![item], index, ctx);
-    }
-
     fn insert_items(&mut self, items: Vec<Item>, index: Option<usize>) -> bool {
         if items.is_empty() {
             return false;
         }
         let index = index.unwrap_or(self.items.len()).min(self.items.len());
-        self.selected = Some(index + items.len() - 1);
+        self.selection.select_range(index..index + items.len());
         self.items.splice(index..index, items);
         self.modified = true;
         self.error = None;
@@ -188,16 +184,9 @@ impl Playlist {
         }
     }
 
-    pub fn move_to(&mut self, from: usize, before: Option<usize>) {
-        if from >= self.items.len() {
-            return;
-        }
-        let before = before.unwrap_or(self.items.len()).min(self.items.len());
-        let destination = before - usize::from(before > from);
-        if destination != from {
-            let item = self.items.remove(from);
-            self.items.insert(destination, item);
-            self.selected = Some(destination);
+    pub fn move_to(&mut self, range: std::ops::Range<usize>, before: Option<usize>) {
+        if let Some(moved) = dragdrop::move_range(&mut self.items, range, before) {
+            self.selection.select_range(moved);
             self.modified = true;
         }
     }
@@ -215,7 +204,7 @@ impl Playlist {
         let (items, skipped) = read_playlist(&path)?;
         self.items = items;
         self.path = Some(path);
-        self.selected = None;
+        self.selection = Selection::default();
         self.modified = false;
         self.error = None;
         self.notice = (skipped > 0).then(|| format!("Skipped {skipped} unsupported entries."));
@@ -273,7 +262,7 @@ impl Playlist {
         match pending {
             Pending::New => {
                 self.items.clear();
-                self.selected = None;
+                self.selection = Selection::default();
                 self.path = None;
                 self.modified = false;
                 self.error = None;
@@ -404,23 +393,26 @@ impl Playlist {
         }
     }
 
-    fn move_selected(&mut self, direction: i32) {
-        let Some(index) = self.selected else {
-            return;
-        };
-        let next = index as i32 + direction;
-        if (0..self.items.len() as i32).contains(&next) {
-            self.items.swap(index, next as usize);
-            self.selected = Some(next as usize);
-            self.modified = true;
+    fn move_selected(&mut self, down: bool) {
+        if let Some(range) = self.selection.range() {
+            let before = if down {
+                range.end + 1
+            } else {
+                range.start.saturating_sub(1)
+            };
+            self.move_to(range, Some(before));
         }
     }
 
     fn remove_selected(&mut self) {
-        if let Some(index) = self.selected.filter(|i| *i < self.items.len()) {
-            self.items.remove(index);
+        if let Some(range) = self.selection.range() {
+            let start = range.start;
+            self.items.drain(range);
             self.modified = true;
-            self.selected = (!self.items.is_empty()).then(|| index.min(self.items.len() - 1));
+            self.selection = Selection::default();
+            if !self.items.is_empty() {
+                self.selection.click(start.min(self.items.len() - 1), false);
+            }
         }
     }
 
@@ -486,21 +478,26 @@ impl Playlist {
             }
         });
         ui.horizontal(|ui| {
-            let selected = self.selected.filter(|i| *i < self.items.len());
+            let selected = self.selection.range();
             if ui
-                .add_enabled(selected.is_some_and(|i| i > 0), egui::Button::new("Up"))
+                .add_enabled(
+                    selected.as_ref().is_some_and(|range| range.start > 0),
+                    egui::Button::new("Up"),
+                )
                 .clicked()
             {
-                self.move_selected(-1);
+                self.move_selected(false);
             }
             if ui
                 .add_enabled(
-                    selected.is_some_and(|i| i + 1 < self.items.len()),
+                    selected
+                        .as_ref()
+                        .is_some_and(|range| range.end < self.items.len()),
                     egui::Button::new("Down"),
                 )
                 .clicked()
             {
-                self.move_selected(1);
+                self.move_selected(true);
             }
             if ui
                 .add_enabled(selected.is_some(), egui::Button::new("Remove"))
@@ -554,16 +551,29 @@ impl Playlist {
                                 .add_sized(
                                     [(ui.available_width() - 4.0).max(40.0), 24.0],
                                     egui::Button::new(format!("{}. {}", index + 1, item.title))
-                                        .selected(self.selected == Some(index))
+                                        .selected(self.selection.contains(index))
                                         .sense(egui::Sense::click_and_drag())
                                         .truncate(),
                                 )
                                 .on_hover_text(item.path.display().to_string());
-                            dragdrop::source(&response, item.clone(), Origin::Playlist(index));
+                            response.clone().on_hover_cursor(egui::CursorIcon::Grab);
+                            let extend = ui.input(|input| input.modifiers.shift);
                             if response.clicked() {
-                                self.selected = Some(index);
+                                self.selection.click(index, extend);
                             }
-                            if response.double_clicked() && item.available != Some(false) {
+                            if response.drag_started_by(egui::PointerButton::Primary) {
+                                self.selection.start_drag(index, extend);
+                                let range = self.selection.range().unwrap();
+                                dragdrop::source_many(
+                                    &response,
+                                    Music {
+                                        items: self.items[range.clone()].to_vec(),
+                                        origin: Origin::Playlist(range),
+                                    },
+                                );
+                            }
+                            if response.double_clicked() && !extend && item.available != Some(false)
+                            {
                                 load = Some((active, item.path.clone()));
                             }
                         });
@@ -596,7 +606,12 @@ impl Playlist {
                         );
                         ui.separator();
                     });
-                    drops.playlist_row(ui, row.response.rect, index);
+                    drops.list_row(
+                        ui,
+                        row.response.rect,
+                        |at| Target::Playlist(Some(at)),
+                        index,
+                    );
                 }
             });
         load
@@ -624,10 +639,10 @@ mod tests {
                 Item::new(second.clone(), None),
                 Item::new(first.clone(), None),
             ],
-            selected: Some(1),
             ..Default::default()
         };
-        playlist.move_selected(-1);
+        playlist.selection.click(1, false);
+        playlist.move_selected(false);
         let target = temp.path().join("Mein Set.m3u8");
         playlist.save_to(target.clone()).unwrap();
         assert!(!playlist.modified);
@@ -638,7 +653,7 @@ mod tests {
             vec![&second, &first, &first]
         );
         assert_eq!(loaded.items[1].title, "Grüße, Welt");
-        loaded.selected = Some(0);
+        loaded.selection.click(0, false);
         loaded.remove_selected();
         loaded.save_to(target.clone()).unwrap();
         let (again, _) = read_playlist(&target).unwrap();
@@ -695,8 +710,8 @@ mod tests {
         );
         playlist.insert_items(vec![Item::new(b.clone(), None)], Some(1));
         assert!(playlist.modified);
-        playlist.move_to(0, None);
-        playlist.move_to(1, Some(0));
+        playlist.move_to(0..1, None);
+        playlist.move_to(1..2, Some(0));
         let file = temp.path().join("dragged.m3u8");
         playlist.save_to(file.clone()).unwrap();
         let (items, _) = read_playlist(&file).unwrap();

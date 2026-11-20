@@ -1,23 +1,111 @@
 //! Internal file dragging; destinations consume a release once, after all panels render.
 use crate::playlist::Item;
 use eframe::egui::{self, Color32, Context, Id, LayerId, Order, Pos2, Rect, Response, Stroke};
+use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
     Browser,
     Session,
-    Playlist(usize),
+    Playlist(Range<usize>),
+    AutoDj(Range<usize>),
 }
 
 #[derive(Clone)]
 pub struct Music {
-    pub item: Item,
+    pub items: Vec<Item>,
     pub origin: Origin,
 }
 
 pub fn source(response: &Response, item: Item, origin: Origin) {
-    response.dnd_set_drag_payload(Music { item, origin });
-    response.clone().on_hover_cursor(egui::CursorIcon::Grab);
+    source_many(
+        response,
+        Music {
+            items: vec![item],
+            origin,
+        },
+    );
+}
+
+pub fn source_many(response: &Response, music: Music) {
+    response.dnd_set_drag_payload(music);
+}
+
+#[derive(Default)]
+pub(crate) struct Selection {
+    anchor: Option<usize>,
+    focus: Option<usize>,
+    rows: Vec<usize>,
+}
+
+impl Selection {
+    pub fn click(&mut self, row: usize, extend: bool) {
+        let anchor = self.anchor.filter(|_| extend).unwrap_or(row);
+        self.anchor = Some(anchor);
+        self.focus = Some(row);
+        self.rows = (anchor.min(row)..=anchor.max(row)).collect();
+    }
+
+    pub fn start_drag(&mut self, row: usize, extend: bool) {
+        if !self.contains(row) {
+            self.click(row, extend);
+        }
+    }
+
+    pub fn contains(&self, row: usize) -> bool {
+        self.rows.binary_search(&row).is_ok()
+    }
+
+    pub fn focus(&self) -> Option<usize> {
+        self.focus
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.rows.iter().copied()
+    }
+
+    pub fn range(&self) -> Option<Range<usize>> {
+        Some(*self.rows.first()?..self.rows.last()? + 1)
+    }
+
+    pub fn select_range(&mut self, range: Range<usize>) {
+        self.anchor = Some(range.start);
+        self.focus = Some(range.end - 1);
+        self.rows = range.collect();
+    }
+
+    pub fn remap(&mut self, mut position: impl FnMut(usize) -> Option<usize>) {
+        self.rows = self.rows().filter_map(&mut position).collect();
+        self.rows.sort_unstable();
+        self.focus = self
+            .focus
+            .and_then(&mut position)
+            .or_else(|| self.rows.last().copied());
+        self.anchor = self.anchor.and_then(position).or(self.focus);
+    }
+}
+
+/// Move an ordered block to a boundary in the original list.
+pub(crate) fn move_range<T>(
+    items: &mut [T],
+    range: Range<usize>,
+    before: Option<usize>,
+) -> Option<Range<usize>> {
+    if range.is_empty() || range.end > items.len() {
+        return None;
+    }
+    let before = before.unwrap_or(items.len()).min(items.len());
+    let length = range.len();
+    let start = if before < range.start {
+        items[before..range.end].rotate_right(length);
+        before
+    } else if before > range.end {
+        items[range.start..before].rotate_left(length);
+        before - length
+    } else {
+        return None;
+    };
+    Some(start..start + length)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +114,7 @@ pub enum Target {
     Session,
     /// None appends; Some inserts before the given item.
     Playlist(Option<usize>),
-    AutoDj,
+    AutoDj(Option<usize>),
 }
 
 struct Zone {
@@ -51,7 +139,13 @@ impl Zones {
         });
     }
 
-    pub fn playlist_row(&mut self, ui: &egui::Ui, rect: Rect, index: usize) {
+    pub fn list_row(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        target: impl FnOnce(usize) -> Target,
+        index: usize,
+    ) {
         let below = ui.input(|i| {
             i.pointer
                 .latest_pos()
@@ -59,7 +153,7 @@ impl Zones {
         });
         let clipped = rect.intersect(ui.clip_rect());
         self.zones.push(Zone {
-            target: Target::Playlist(Some(index + usize::from(below))),
+            target: target(index + usize::from(below)),
             rect: clipped,
             layer: ui.layer_id(),
             line: Some(if below {
@@ -115,7 +209,11 @@ impl Zones {
         if let Some(pointer) = ctx.input(|i| i.pointer.latest_pos()) {
             let painter =
                 ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("music-drag-preview")));
-            let title: String = payload.item.title.chars().take(55).collect();
+            let title = if payload.items.len() == 1 {
+                payload.items[0].title.chars().take(55).collect()
+            } else {
+                format!("{} tracks", payload.items.len())
+            };
             let galley =
                 painter.layout_no_wrap(title, egui::FontId::proportional(13.0), Color32::WHITE);
             let size = galley.size() + egui::vec2(16.0, 12.0);
@@ -160,11 +258,18 @@ mod tests {
                         Rect::from_min_max(egui::pos2(15.0, 15.0), egui::pos2(180.0, 60.0)),
                         Sense::click_and_drag(),
                     );
-                    source(
-                        &response,
-                        Item::new(PathBuf::from("test.mp3"), None),
-                        Origin::Browser,
-                    );
+                    if response.drag_started() {
+                        source_many(
+                            &response,
+                            Music {
+                                items: ["first.mp3", "second.flac"]
+                                    .into_iter()
+                                    .map(|path| Item::new(PathBuf::from(path), None))
+                                    .collect(),
+                                origin: Origin::Browser,
+                            },
+                        );
+                    }
                     let mut zones = Zones::default();
                     zones.add(
                         Target::Deck(0),
@@ -228,11 +333,47 @@ mod tests {
             assert!(frame(&ctx, vec![Event::PointerMoved(pos)]).is_none());
             let (actual, music) = frame(&ctx, vec![button(pos, false)]).unwrap();
             assert_eq!(actual, target);
-            assert_eq!(music.item.path, PathBuf::from("test.mp3"));
+            assert_eq!(
+                music
+                    .items
+                    .iter()
+                    .map(|item| item.path.as_path())
+                    .collect::<Vec<_>>(),
+                [
+                    std::path::Path::new("first.mp3"),
+                    std::path::Path::new("second.flac")
+                ],
+            );
             assert_eq!(music.origin, Origin::Browser);
             assert!(frame(&ctx, vec![]).is_none());
             assert!(!egui::DragAndDrop::has_any_payload(&ctx));
         }
+    }
+
+    #[test]
+    fn shift_drag_keeps_order_and_reorders_selected_rows_as_a_block() {
+        let mut selection = Selection::default();
+        selection.click(3, false);
+        selection.click(1, true);
+        selection.start_drag(2, false);
+        let mut tracks = ['A', 'B', 'C', 'B', 'D', 'E'];
+        assert_eq!(selection.rows().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(move_range(&mut tracks, 1..4, Some(3)), None);
+        let moved = move_range(&mut tracks, selection.range().unwrap(), None).unwrap();
+        assert_eq!(tracks, ['A', 'D', 'E', 'B', 'C', 'B']);
+        assert_eq!(moved, 3..6);
+        assert_eq!(move_range(&mut tracks, moved, Some(0)), Some(0..3));
+        assert_eq!(tracks, ['B', 'C', 'B', 'A', 'D', 'E']);
+        selection.remap(|row| {
+            [Some(1), Some(5), None, Some(2)]
+                .get(row)
+                .copied()
+                .flatten()
+        });
+        assert_eq!(selection.rows().collect::<Vec<_>>(), vec![2, 5]);
+        assert_eq!(selection.focus(), Some(5));
+        selection.start_drag(4, false);
+        assert_eq!(selection.range(), Some(4..5));
     }
 
     #[test]

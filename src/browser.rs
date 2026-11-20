@@ -1,14 +1,14 @@
 use crate::{
     analysis::{self, Job},
     database::{self, CollectionTrack, Database, Fingerprint, Lookup, Summary},
-    dragdrop::{self, Origin},
+    dragdrop::{self, Music, Origin, Selection},
     playlist::Item,
     track,
 };
 use eframe::egui::{self, RichText, Vec2};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -82,7 +82,7 @@ struct Collection {
 pub struct Browser {
     pub settings: BrowserSettings,
     pub dirty: bool,
-    pub selected: Option<usize>,
+    selection: Selection,
     pub error: Option<String>,
     entries: Vec<Entry>,
     filtered: Vec<usize>,
@@ -105,8 +105,8 @@ pub struct Browser {
 
 pub enum Event {
     Load(usize, PathBuf),
-    Playlist(PathBuf),
-    AutoDj(PathBuf),
+    Playlist(Vec<PathBuf>),
+    AutoDj(Vec<PathBuf>),
 }
 
 pub fn scan(path: &Path) -> Result<Vec<Entry>, String> {
@@ -197,7 +197,7 @@ impl Browser {
         let mut browser = Self {
             settings,
             dirty: false,
-            selected: None,
+            selection: Selection::default(),
             error: None,
             entries: Vec::new(),
             filtered: Vec::new(),
@@ -233,7 +233,7 @@ impl Browser {
         self.collection.open = false;
         self.search.clear();
         self.path_edit = path.to_string_lossy().into_owned();
-        self.selected = None;
+        self.selection = Selection::default();
         self.entries.clear();
         self.filtered.clear();
         self.error = None;
@@ -287,11 +287,10 @@ impl Browser {
 
     fn selected_entry(&self) -> Option<&Entry> {
         self.display_entries()
-            .get(*self.filtered.get(self.selected?)?)
+            .get(*self.filtered.get(self.selection.focus()?)?)
     }
 
     fn refilter(&mut self) {
-        let selected = self.selected_entry().map(|entry| entry.path.clone());
         let entries = self.display_entries();
         let mut filtered: Vec<_> = (0..entries.len()).collect();
         let descending = self.descending;
@@ -335,8 +334,12 @@ impl Browser {
                 })
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        self.selected =
-            selected.and_then(|path| filtered.iter().position(|i| entries[*i].path == path));
+        let mut new_positions = vec![0; filtered.len()];
+        for (row, &entry) in filtered.iter().enumerate() {
+            new_positions[entry] = row;
+        }
+        self.selection
+            .remap(|row| new_positions.get(*self.filtered.get(row)?).copied());
         self.filtered = filtered;
     }
 
@@ -354,7 +357,7 @@ impl Browser {
         self.collection.limit = COLLECTION_PAGE;
         self.collection.revision = self.collection.revision.wrapping_add(1);
         self.collection.search_due = Some(Instant::now() + Duration::from_millis(120));
-        self.selected = None;
+        self.selection = Selection::default();
         self.filtered.clear();
 
         if !self.collection.backfill_started {
@@ -384,7 +387,7 @@ impl Browser {
     fn show_folder(&mut self) {
         self.collection.open = false;
         self.search.clear();
-        self.selected = None;
+        self.selection = Selection::default();
         self.refilter();
     }
 
@@ -463,7 +466,9 @@ impl Browser {
                             self.collection.error = None;
                             self.collection.more = tracks.len() > self.collection.limit;
                             tracks.truncate(self.collection.limit);
-                            let previous = self.selected_entry().map(|entry| entry.path.clone());
+                            let mut selection = std::mem::take(&mut self.selection);
+                            let old_order = std::mem::take(&mut self.filtered);
+                            let old_entries = std::mem::take(&mut self.collection.entries);
                             self.collection.entries = tracks
                                 .into_iter()
                                 .map(|track| {
@@ -499,13 +504,20 @@ impl Browser {
                                     }
                                 })
                                 .collect();
-                            self.selected = None;
                             self.refilter();
-                            self.selected = previous.and_then(|path| {
-                                self.filtered
-                                    .iter()
-                                    .position(|&index| self.collection.entries[index].path == path)
+                            let positions: HashMap<_, _> = self
+                                .filtered
+                                .iter()
+                                .enumerate()
+                                .map(|(row, &entry)| {
+                                    (self.collection.entries[entry].path.as_path(), row)
+                                })
+                                .collect();
+                            selection.remap(|row| {
+                                let entry = old_entries.get(*old_order.get(row)?)?;
+                                positions.get(entry.path.as_path()).copied()
                             });
+                            self.selection = selection;
                         }
                         Err(error) => self.collection.error = Some(error),
                     }
@@ -668,10 +680,24 @@ impl Browser {
         (!entry.directory).then(|| entry.path.clone())
     }
 
+    fn selected_files(&self) -> impl Iterator<Item = &Entry> {
+        let entries = self.display_entries();
+        self.selection.rows().filter_map(|row| {
+            let entry = entries.get(*self.filtered.get(row)?)?;
+            (!entry.directory).then_some(entry)
+        })
+    }
+
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected_files()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     pub fn step_selection(&mut self, amount: i32) {
         if !self.filtered.is_empty() {
             self.scroll_selection = true;
-            self.selected = Some(match self.selected {
+            let row = match self.selection.focus() {
                 Some(index) => {
                     (index as i32 + amount).clamp(0, self.filtered.len() as i32 - 1) as usize
                 }
@@ -682,7 +708,8 @@ impl Browser {
                         0
                     }
                 }
-            });
+            };
+            self.selection.click(row, false);
         }
     }
 
@@ -760,12 +787,12 @@ impl Browser {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(
-                        self.selected_path().is_some(),
+                        self.selected_files().next().is_some(),
                         egui::Button::new("+ Playlist"),
                     )
                     .clicked()
                 {
-                    event = self.selected_path().map(Event::Playlist);
+                    event = Some(Event::Playlist(self.selected_paths()));
                 }
                 for &deck in deck_order.iter().rev() {
                     if ui
@@ -1001,7 +1028,7 @@ impl Browser {
                     .auto_shrink([false, false]);
                 if self.scroll_selection {
                     scroll = scroll.vertical_scroll_offset(
-                        (self.selected.unwrap_or(0) as f32 * (FILE_ROW_HEIGHT + ui.spacing().item_spacing.y)
+                        (self.selection.focus().unwrap_or(0) as f32 * (FILE_ROW_HEIGHT + ui.spacing().item_spacing.y)
                             - height * 0.5)
                             .max(0.0),
                     );
@@ -1020,7 +1047,7 @@ impl Browser {
                                 Vec2::new((ui.available_width() - 432.0).max(80.0), FILE_ROW_HEIGHT),
                                 egui::Sense::hover(),
                             );
-                            if self.selected == Some(row) {
+                            if self.selection.contains(row) {
                                 ui.painter()
                                     .rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
                             } else if row % 2 == 0 {
@@ -1070,22 +1097,40 @@ impl Browser {
                                 }
                             }
                         });
-                        if !entry.directory {
-                            let mut item = Item::new(entry.path.clone(), None);
-                            item.summary = entry.analysis.clone();
-                            item.available = Some(true);
-                            dragdrop::source(&response, item, Origin::Browser);
+                        let mut add_to_autodj = false;
+                        let file = !entry.directory;
+                        if file {
+                            response.clone().on_hover_cursor(egui::CursorIcon::Grab);
                             response.context_menu(|ui| {
                                 if ui.button("Add to AutoDJ").clicked() {
-                                    event = Some(Event::AutoDj(entry.path.clone()));
+                                    add_to_autodj = true;
                                     ui.close();
                                 }
                             });
                         } else {
                             folder_menu(&response, &entry.path, self.job.is_none(), &mut folder_scan);
                         }
-                        if response.clicked() || response.drag_started() { self.selected = Some(row); }
-                        if response.double_clicked() { self.selected = Some(row); activate = true; }
+                        let extend = ui.input(|input| input.modifiers.shift);
+                        if response.clicked() {
+                            self.selection.click(row, extend);
+                        }
+                        if response.double_clicked() && !extend {
+                            activate = true;
+                        }
+                        if file && response.drag_started_by(egui::PointerButton::Primary) {
+                            self.selection.start_drag(row, extend);
+                            let items = self.selected_files().map(|entry| {
+                                let mut item = Item::new(entry.path.clone(), None);
+                                item.summary = entry.analysis.clone();
+                                item.available = Some(true);
+                                item
+                            }).collect();
+                            dragdrop::source_many(&response, Music { items, origin: Origin::Browser });
+                        }
+                        if add_to_autodj {
+                            self.selection.start_drag(row, false);
+                            event = Some(Event::AutoDj(self.selected_paths()));
+                        }
                     }
                 });
                 if activate {
