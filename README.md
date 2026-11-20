@@ -4,48 +4,48 @@
 
 # RustDJ 0.23.8
 
-RustDJ is a native DJ application for Windows and Linux, written in Rust. It combines four
-decks, a central mixer, a music browser, MIDI controller support, SHOUTcast
-streaming and MP3 recording in one desktop application.
+RustDJ is a desktop DJ and broadcasting app for Windows and Linux. Mix with
+two or four decks, browse your music, and send the master mix to SHOUTcast
+while recording it locally. See the [changelog](CHANGELOG.md) for version history.
 
-<img width="1919" height="1030" alt="image" src="https://github.com/user-attachments/assets/c2c3de82-9934-42e5-8d6e-faeae5fc0325" />
+<img width="1919" height="1030" alt="RustDJ desktop interface" src="https://github.com/user-attachments/assets/c2c3de82-9934-42e5-8d6e-faeae5fc0325" />
 
 ## Features
 
-- Four independent decks, arranged **1 · 3 · 4 · 2**.
-- Deck colors: **1 purple, 3 pink, 4 turquoise, 2 yellow**.
-- MP3 and FLAC playback, plus WAV, Ogg, M4A, AAC and AIFF decoding.
-- Detailed, scrolling waveforms with separate colors for low, mid and high frequencies.
-- A file browser with BPM, musical key and a persistent SQLite analysis cache.
-- Saved M3U8 playlists, a session sidelist and drag-and-drop loading.
-- Eight saved hotcues and eight direct beat-loop buttons per deck.
-- Per-deck gain, three-band EQ, channel fader, headphone cue, filter and effects.
-- A switchable crossfader and an additional saved 10-band master equalizer.
-- Independent master and headphone output devices/channel pairs with stereo meters.
-- Model-specific Pioneer, Roland and Numark profiles, auto-connect, saved custom
-  mappings, JSON import/export, MIDI learn and supported LED feedback.
-- Original Pioneer DDJ-SX profile with four native decks, mixer, hotcues,
-  direct loop pads and banked FX; see [DDJ-SX setup](CONTROLLERS.md#pioneer-ddj-sx-setup).
-- SHOUTcast-compatible broadcasting with verified TLS, optional HTTPS track titles
-  and independent MP3 recording.
+- **Mixing.** Two- and four-deck layouts, scrolling three-band waveforms,
+  eight hotcues and eight beat-loop buttons per deck, plus EQ, filters and effects.
+- **Library.** A dedicated browser view, BPM and key analysis, an editable
+  beatgrid, M3U8 playlists, and a set history with CSV export.
+- **Live audio.** Independent master and headphone routing, two external
+  inputs, a dedicated microphone channel, Talkover, four jingle pads, a
+  10-band master EQ and a master limiter.
+- **Broadcasting.** SHOUTcast profiles with protected passwords, verified TLS,
+  optional track titles, reconnect and independent MP3 recording.
+- **Controllers.** MIDI Learn, custom mappings, LED feedback on supported
+  controllers, and Pioneer, Roland and Numark presets. [Controller setup](CONTROLLERS.md)
 
 ## Getting started
 
-On Linux Mint, Ubuntu or Debian, install the Debian package with
-`sudo apt install ./rustdj_0.23.8_amd64.deb` and launch **RustDJ** from the
-application menu or run `rustdj`. Use the package matching your system
-architecture. The package built on Linux Mint 22.3 targets its Ubuntu 24.04
-base. For distributions with older system libraries, build the package on
-the target distribution.
+On Linux Mint, Ubuntu or Debian, [build a Debian package](#linux). From the
+repository root, install the amd64 package and launch RustDJ from the
+application menu or run `rustdj`.
 
-On Windows, [build from source](#building-from-source) and start
-`target\release\rustdj.exe`. Neither installed Linux packages nor Windows
-release executables require Rust on the playback computer.
+```bash
+sudo apt install ./outputs/rustdj_0.23.8_amd64.deb
+```
+
+The Linux build was tested on Linux Mint 22.3, which uses an Ubuntu 24.04
+base. Build on the distribution you plan to support if it uses older system
+libraries. The package filename includes the target architecture.
+
+On Windows, [build from source](#windows) and start
+`target\release\rustdj.exe`. Rust is needed to build the application.
+The installed Linux package and Windows release executable run on their own.
 
 1. Open **Audio / Outputs** and select the master output for your speakers.
 2. Select a separate headphone device or a different stereo channel pair.
 3. Use **Folder …** in the music browser to choose your music folder.
-4. Select a track and click **1**, **3**, **4** or **2**, or drag it onto a deck.
+4. Select a track and click the number of the deck you want, or drag the track onto it.
 5. Press **PLAY**. Adjust channel levels and the always-visible **MASTER** control.
 
 The header shows the controller as **ON** or **OFF**, the selected sound cards
@@ -90,8 +90,8 @@ the center. The enabled/disabled setting is saved.
 
 Channel meters show peak levels after gain/EQ and before the channel fader.
 Master and headphone stereo meters measure the actual summed output on each
-selected channel pair. Numeric values are in dBFS; silence appears as
-**-infinity** and **CLIP** indicates peaks at or above 0 dBFS.
+selected channel pair. Numeric values are in dBFS. Silence appears as **−∞**.
+**CLIP** indicates peaks at or above 0 dBFS.
 
 ### Master equalizer
 
@@ -123,7 +123,8 @@ current folder. The last folder and favorites are saved between sessions.
 Double-click a folder to open it. Search filters the current folder without
 recursively scanning subfolders.
 
-The file list includes duration, BPM, key, analysis state, format and size.
+RustDJ decodes MP3, FLAC, WAV, Ogg, M4A, AAC and AIFF. The file list shows
+duration, BPM, key, analysis state, format and size.
 Beat analysis detects transients separately in the bass, mid and high bands.
 It estimates a constant tempo from recurring accents and aligns the grid with
 the detected beats. This follows the general onset and autocorrelation
@@ -317,15 +318,16 @@ and **REC** show the current state and elapsed time. Hover over either status fo
 details, including the recording file or connection errors. Click **STREAMER**
 in the central mixer to open **SHOUTcast / MP3 Recording** and edit its settings.
 
-Use **New profile** in **STREAMER** to save a second destination. Give it a
+Use **New profile** in **STREAMER** to save another destination. Give it a
 name, enter its host, ports and stream ID, and select the desired profile
 before starting the broadcast. RustDJ remembers the selected profile. Each
 profile has its own protected password. The previous single destination
 becomes the **Default** profile.
 
-Both features capture the stereo master after channel processing, crossfader,
-master level and master EQ. Direct headphone cue is excluded. Muting the
-software master also mutes the stream and recording.
+Both features capture the stereo master after channel processing,
+crossfader, master EQ and the optional limiter. Enabled microphones, external
+inputs and playing jingles are part of that mix. Headphone cue has its own bus.
+The **MASTER** control sets the level for speakers, streaming and recording.
 
 Enter the hostname/IP, source port, metadata/admin port, stream ID, source
 password and optional station details. **TLS (certificate verified)** is the
@@ -373,9 +375,9 @@ The desktop needs a Secret Service provider, such as GNOME Keyring.
 **Remove saved password** deletes the selected profile's keyring entry.
 Streaming and recording never start automatically.
 
-Audio capture uses bounded buffers and background encoding/network workers;
-the audio callback does not perform disk or network I/O. Overflow or connection
-errors stop the affected output and appear in the streamer window.
+Audio capture uses bounded buffers and background workers for encoding, disk
+writes and networking. The header and streamer window report connection and
+recording errors. Enable reconnect per profile to retry a dropped broadcast.
 
 ## Live tools
 
@@ -389,8 +391,8 @@ errors stop the affected output and appear in the streamer window.
   attempts after loss of an active broadcast. The header shows retry status,
   **Stop stream** cancels it, and recording continues independently.
 - **History** lists recent plays in local time and exports the full list as CSV
-  with UTC timestamps. RustDJ logs the first two continuous seconds in the
-  master mix for each loaded track.
+  with UTC timestamps. RustDJ adds an entry once a loaded track has played for
+  two consecutive seconds in the master mix.
 - Open **Beatgrid editor …** in the deck's BPM menu to set the tempo and first
   beat. **Save beatgrid** stores the correction for the file. **Use detected
   grid** removes the correction. The editor uses a fixed tempo.
@@ -411,22 +413,22 @@ errors stop the affected output and appear in the streamer window.
 | Left / Right arrow | Move the crossfader when enabled |
 
 Clicking a deck selects it. Playback shortcuts are suppressed while entering
-text. Transport cue points, manual BPM corrections and the session sidelist
-last only for the current session; saved hotcues and library analyses persist.
+text. Transport cues, quick BPM edits and the sidelist belong to the current
+session. **Save beatgrid** in the BPM editor stores tempo and first-beat
+corrections across sessions, alongside persistent hotcues and analyses.
 
 ## Settings and data
 
-On Windows, preferences are stored in `%APPDATA%\RustDJ\settings.json`, including
-browser favorites, MIDI mappings, preferred controller, audio routing, mix
-levels, crossfader state, master EQ and streamer settings. Existing settings
-continue to work after the English-language update; user paths and titles are
-not translated or renamed.
+Preferences include the deck layout, browser favorites, MIDI mappings,
+input and output routing, stream profiles and live-tool settings. Windows
+stores preferences in `%APPDATA%\RustDJ\settings.json`. Linux uses
+`${XDG_CONFIG_HOME:-$HOME/.config}/RustDJ/settings.json`.
 
-On Linux, settings are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/RustDJ/settings.json`.
-Library analyses, waveform data and hotcues are stored in SQLite under
-`${XDG_DATA_HOME:-$HOME/.local/share}/RustDJ/library.sqlite3`. An existing database
-in `~/.config/RustDJ` remains usable. Set `RUSTDJ_DATA_DIR` to choose a different
-library directory. On Windows the database defaults to `%APPDATA%\RustDJ`.
+SQLite stores track analyses, waveforms, hotcues, beatgrid corrections and
+set history. The Windows database defaults to `%APPDATA%\RustDJ\library.sqlite3`.
+On Linux it is at `${XDG_DATA_HOME:-$HOME/.local/share}/RustDJ/library.sqlite3`.
+RustDJ continues to use an existing Linux database in `~/.config/RustDJ` if
+the new location is empty. Set `RUSTDJ_DATA_DIR` to choose a library directory.
 
 ## Building from source
 
@@ -497,10 +499,11 @@ The `work/` folder is used for local checks and packaging and is not committed.
 | --- | --- |
 | `app`, `browser`, `playlist`, `dragdrop` | Desktop UI and library workflow |
 | `branding`, `assets/branding`, `build.rs` | Embedded logo, window icon and Windows executable resources |
-| `audio`, `output`, `dsp`, `effects`, `equalizer`, `loops` | Playback, routing and signal processing |
+| `audio`, `output`, `inputs`, `dsp`, `effects`, `equalizer`, `loops` | Playback, live inputs, routing and signal processing |
+| `broadcast_mix`, `jingles` | Talkover, master limiting and jingle pads |
 | `midi`, `decks` | Controller mapping and deck identity |
 | `track`, `analysis`, `beat`, `key`, `waveform` | Decoding and track analysis |
-| `database`, `performance`, `settings`, `credentials` | Cached data and saved preferences |
+| `database`, `performance`, `settings`, `credentials` | Analyses, beatgrid corrections, set history, preferences and protected passwords |
 | `capture`, `streamer`, `stream_transport` | Master capture, verified TLS, SHOUTcast and MP3 recording |
 
 The GUI uses eframe/egui. Playback uses rodio/Symphonia, MIDI uses midir, SQLite
@@ -514,7 +517,8 @@ so the application can be rebuilt and relinked with modified libraries.
 
 ## Current limitations
 
-RustDJ is under active development. BPM/key estimates and Sync depend on the
-material and beat grid. Audio device latency can vary. A complete hardware
+RustDJ is under active development. Beat detection and the beatgrid editor
+use a single tempo per track. Sync depends on the accuracy of those grids.
+Audio device latency can vary. A complete hardware
 verification of every DJ-202 function is still required. Features such as
 stems, video mixing, timecode control and ASIO are not implemented.
