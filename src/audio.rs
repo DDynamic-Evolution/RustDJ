@@ -9,8 +9,10 @@ use crate::{
     output::ChannelPair,
     performance::{Hotcues, Snapshot},
 };
-use rodio::{OutputStream, Sink, Source, source::SeekError};
+use rodio::{Decoder, OutputStream, Sink, Source, source::SeekError};
 use std::{
+    fs::File,
+    io::BufReader,
     path::PathBuf,
     sync::{
         Arc,
@@ -20,16 +22,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct LoadJob {
+pub(crate) struct LoadJob {
     receiver: Receiver<Result<Loaded, String>>,
     cancelled: Arc<AtomicBool>,
 }
+
+type TrackDecoder = Decoder<BufReader<File>>;
 
 struct Loaded {
     track: Track,
     cues: Hotcues,
     identity: Fingerprint,
     corrected_grid: Option<BeatGrid>,
+    decoder: Option<TrackDecoder>,
 }
 
 struct LoopJob {
@@ -208,17 +213,17 @@ impl CueLatch {
 }
 
 fn make_voice(
-    track: &Track,
+    decoder: TrackDecoder,
     stream: &OutputStream,
     pair: u16,
     eq: Arc<EqParams>,
     mixer: &rodio::mixer::Mixer,
     fx_params: Arc<EffectParams>,
-) -> Result<Voice, String> {
+) -> Voice {
     let media_samples = Arc::new(AtomicU64::new(0));
     let fault = Arc::new(AtomicBool::new(false));
     let (transport, loop_control) = loops::Transport::new(
-        track::open_decoder(&track.path)?,
+        decoder,
         media_samples.clone(),
         fault.clone(),
     );
@@ -236,13 +241,13 @@ fn make_voice(
         stream.config().channel_count(),
         pair,
     ));
-    Ok(Voice {
+    Voice {
         sink,
         peak,
         media_samples,
         loop_control,
         fault,
-    })
+    }
 }
 
 impl Default for Deck {
@@ -287,7 +292,14 @@ impl Default for Deck {
 
 impl Deck {
     pub fn load(&mut self, path: PathBuf, ctx: eframe::egui::Context) {
-        self.load_serial = self.load_serial.wrapping_add(1);
+        self.load_prepared(Self::prepare_load(path, ctx, false));
+    }
+
+    pub(crate) fn prepare_load(
+        path: PathBuf,
+        ctx: eframe::egui::Context,
+        preload_audio: bool,
+    ) -> LoadJob {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancelled.clone();
         let (sender, receiver) = mpsc::channel();
@@ -324,7 +336,9 @@ impl Deck {
                         ([None; 8], None)
                     }
                 };
+                let decoder = preload_audio.then(|| track::open_decoder(&track.path)).transpose()?;
                 Ok(Loaded {
+                    decoder,
                     track,
                     cues,
                     identity,
@@ -334,10 +348,12 @@ impl Deck {
             let _ = sender.send(result);
             ctx.request_repaint();
         });
-        self.job = Some(LoadJob {
-            receiver,
-            cancelled,
-        });
+        LoadJob { receiver, cancelled }
+    }
+
+    pub(crate) fn load_prepared(&mut self, job: LoadJob) {
+        self.load_serial = self.load_serial.wrapping_add(1);
+        self.job = Some(job);
         self.error = None;
     }
 
@@ -377,7 +393,8 @@ impl Deck {
                 cues,
                 identity,
                 corrected_grid,
-            }) => match self.make_sink(&track, audio) {
+                decoder,
+            }) => match self.make_sink(&track, audio, decoder) {
                 Ok(sink) => {
                     self.exit_loop();
                     self.loop_range = None;
@@ -406,30 +423,39 @@ impl Deck {
         None
     }
 
-    fn make_sink(&self, track: &Track, audio: &Audio) -> Result<Option<Playback>, String> {
+    fn make_sink(
+        &self,
+        track: &Track,
+        audio: &Audio,
+        decoder: Option<TrackDecoder>,
+    ) -> Result<Option<Playback>, String> {
         let Some(stream) = &audio.stream else {
             return Ok(None);
         };
         self.eq_params.set(self.eq);
         self.eq_params.set_gain(self.gain);
         self.eq_params.set_speed(self.speed);
+        let decoder = match decoder {
+            Some(decoder) => decoder,
+            None => track::open_decoder(&track.path)?,
+        };
         let master = make_voice(
-            track,
+            decoder,
             stream,
             audio.routing.master.pair,
             self.eq_params.clone(),
             audio.bus(false).ok_or("Master mixing bus is missing.")?,
             self.fx_params.clone(),
-        )?;
+        );
         let phones = match (audio.phones(), &audio.routing.phones) {
             (Some(stream), Some(target)) => Some(make_voice(
-                track,
+                track::open_decoder(&track.path)?,
                 stream,
                 target.pair,
                 self.eq_params.clone(),
                 audio.bus(true).ok_or("Headphone mixing bus is missing.")?,
                 self.fx_params.clone(),
-            )?),
+            )),
             _ => None,
         };
         Ok(Some(Playback {
@@ -443,7 +469,7 @@ impl Deck {
         let position = self.position();
         let playing = self.playing();
         if let Some(track) = &self.track {
-            let playback = self.make_sink(track, audio)?;
+            let playback = self.make_sink(track, audio, None)?;
             self.sink = playback;
             self.seek(position, audio);
             self.send_loop(self.loop_buffer.clone());
@@ -542,7 +568,7 @@ impl Deck {
             return false;
         };
         if self.sink.as_ref().is_none_or(|sink| sink.empty()) {
-            match self.make_sink(track, audio) {
+            match self.make_sink(track, audio, None) {
                 Ok(sink) => self.sink = sink,
                 Err(error) => {
                     self.error = Some(error);
@@ -995,6 +1021,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_track_has_a_decoder_before_deck_handoff() {
+        let file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/demo-a.wav"),
+            file.path(),
+        )
+        .unwrap();
+        let deck = Deck::default();
+        let job = Deck::prepare_load(file.path().to_owned(), eframe::egui::Context::default(), true);
+        let loaded = job.receiver.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert!(!deck.loading());
+        assert!(deck.track.is_none());
+        let decoder = loaded.decoder.expect("the next track's master decoder is ready");
+        assert!(decoder.take(4410).any(|sample| sample.abs() > 0.01));
+    }
+
+    #[test]
     fn jog_bend_changes_both_outputs_and_returns_to_the_selected_tempo() {
         let (master, _master_output) = jog_test_voice();
         let (phones, _phones_output) = jog_test_voice();
@@ -1179,6 +1222,7 @@ mod tests {
         let saved = crate::settings::Settings {
             mix: crate::settings::MixSettings {
                 master: values[0],
+                speaker_level: 1.0,
                 phones: values[1],
                 mixing: values[2],
                 crossfader_enabled: false,

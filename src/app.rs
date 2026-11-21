@@ -28,10 +28,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const BG: Color32 = Color32::from_rgb(18, 19, 21);
-const PANEL: Color32 = Color32::from_rgb(36, 38, 41);
-const BORDER: Color32 = Color32::from_rgb(61, 64, 69);
-const MUTED: Color32 = Color32::from_rgb(161, 151, 179);
+const BAR: Color32 = Color32::from_rgb(27, 30, 38);
+const FIELD: Color32 = Color32::from_rgb(24, 27, 35);
+const INK: Color32 = Color32::from_rgb(232, 237, 251);
+const VIOLET: Color32 = Color32::from_rgb(139, 92, 246);
+const INDIGO: Color32 = Color32::from_rgb(79, 70, 229);
+const TEAL: Color32 = Color32::from_rgb(94, 234, 212);
+const SUCCESS: Color32 = Color32::from_rgb(74, 222, 128);
+const RECONNECT: Color32 = Color32::from_rgb(251, 146, 60);
+const SEMIBOLD: &str = "Inter Semibold";
+const AMBER: Color32 = Color32::from_rgb(252, 211, 77);
+const BG: Color32 = Color32::from_rgb(7, 11, 31);
+const PANEL: Color32 = Color32::from_rgb(37, 40, 48);
+const BORDER: Color32 = Color32::from_rgb(54, 59, 71);
+const MUTED: Color32 = Color32::from_rgb(154, 166, 198);
 const PURPLE: Color32 = Color32::from_rgb(174, 119, 255);
 const LIGHT_PURPLE: Color32 = Color32::from_rgb(219, 186, 255);
 const AUX_INPUT_COUNT: usize = 2;
@@ -139,6 +149,7 @@ pub struct RustDj {
     crossfader: Crossfader,
     wave_window: f64,
     master: f32,
+    speaker_level: f32,
     phones: f32,
     mixing: f32,
     show_audio: bool,
@@ -173,6 +184,7 @@ pub struct RustDj {
     live_inputs: [Option<LiveInput>; INPUT_COUNT],
     input_errors: [Option<String>; INPUT_COUNT],
     mic_peak: f32,
+    mic_clip_until: Option<Instant>,
     talkover_settings: TalkoverSettings,
     talkover: Talkover,
     master_limiter: bool,
@@ -204,15 +216,47 @@ pub struct RustDj {
 impl RustDj {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "Inter".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")).into(),
+        );
+        fonts.font_data.insert(
+            SEMIBOLD.into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")).into(),
+        );
+        let proportional = fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap();
+        let mut semibold = proportional.clone();
+        proportional.insert(0, "Inter".into());
+        semibold.insert(0, SEMIBOLD.into());
+        fonts.families.insert(egui::FontFamily::Name(SEMIBOLD.into()), semibold);
+        ctx.set_fonts(fonts);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG;
         visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = Color32::from_rgb(18, 13, 24);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(44, 38, 57);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 51, 83);
-        visuals.selection.bg_fill = Color32::from_rgb(79, 51, 111);
-        visuals.selection.stroke = Stroke::new(1.0_f32, PURPLE);
-        visuals.hyperlink_color = LIGHT_PURPLE;
+        visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+        visuals.extreme_bg_color = FIELD;
+        visuals.faint_bg_color = FIELD;
+        visuals.code_bg_color = FIELD;
+        visuals.warn_fg_color = AMBER;
+        visuals.error_fg_color = WARNING;
+        visuals.selection.bg_fill = INDIGO;
+        visuals.selection.stroke = Stroke::new(1.0_f32, INK);
+        visuals.hyperlink_color = TEAL;
+        let hovered = BORDER.lerp_to_gamma(INK, 0.16);
+        for (widget, fill, border) in [
+            (&mut visuals.widgets.inactive, BORDER, BORDER),
+            (&mut visuals.widgets.hovered, hovered, hovered),
+            (&mut visuals.widgets.active, INDIGO, VIOLET),
+            (&mut visuals.widgets.open, hovered, hovered),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = Stroke::new(1.0_f32, border);
+            widget.fg_stroke = Stroke::new(1.0_f32, INK);
+            widget.corner_radius = egui::CornerRadius::same(5);
+            widget.expansion = 0.0;
+        }
         ctx.set_visuals(visuals);
         ctx.style_mut(|style| {
             style.spacing.item_spacing = Vec2::new(6.0, 5.0);
@@ -234,6 +278,7 @@ impl RustDj {
         let audio = Audio::new(settings.routing.clone());
         audio.master_eq.set(settings.master_eq);
         audio.limiter.set(settings.master_limiter);
+        audio.set_speaker_level(settings.mix.speaker_level);
         if settings.stream_profiles.is_empty() {
             settings.stream_profiles.push(StreamProfile {
                 id: 0,
@@ -267,6 +312,7 @@ impl RustDj {
             crossfader: Crossfader::new(settings.mix.crossfader_enabled),
             wave_window: 4.0,
             master: settings.mix.master.clamp(0.0, 1.0),
+            speaker_level: settings.mix.speaker_level.clamp(0.0, 1.0),
             phones: settings.mix.phones.clamp(0.0, 1.0),
             mixing: settings.mix.mixing.clamp(0.0, 1.0),
             show_audio: false,
@@ -303,6 +349,7 @@ impl RustDj {
             live_inputs: std::array::from_fn(|_| None),
             input_errors: std::array::from_fn(|_| None),
             mic_peak: 0.0,
+            mic_clip_until: None,
             talkover_settings: settings.talkover,
             talkover: Talkover::default(),
             master_limiter: settings.master_limiter,
@@ -554,18 +601,45 @@ impl RustDj {
             }
         });
         ui.separator();
-        ui.columns(2, |columns| {
-            columns[0].horizontal(|ui| {
-                self.stream_control_ui(ui);
-                let status = &self.broadcaster.stream_status;
-                broadcast_status_ui(ui, "STREAM", status, "LIVE", PURPLE);
+        egui::Frame::new()
+            .fill(FIELD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(3)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
+                        self.stream_control_ui(ui);
+                        broadcast_status_ui(ui, &self.broadcaster.stream_status, false);
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        self.recording_control_ui(ui);
+                        broadcast_status_ui(ui, &self.broadcaster.recording_status, true);
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| self.live_mic_ui(ui));
+                });
             });
-            columns[1].horizontal(|ui| {
-                self.recording_control_ui(ui);
-                let status = &self.broadcaster.recording_status;
-                broadcast_status_ui(ui, "REC", status, "RECORDING", LIGHT_PURPLE);
-            });
-        });
+        let stream = &self.broadcaster.stream_status;
+        if matches!(stream.phase, Phase::Error | Phase::Reconnecting) {
+            let recording = if self.broadcaster.recording_status.phase == Phase::Running {
+                " Local recording continues."
+            } else {
+                ""
+            };
+            let message = format!("Stream · {}{recording}", stream.message);
+            let color = if stream.phase == Phase::Reconnecting { RECONNECT } else { WARNING };
+            ui.add(egui::Label::new(RichText::new(message).color(color)).wrap());
+        } else if stream.phase == Phase::Running && let Some(error) = &stream.metadata_error {
+            let message = format!("Stream titles · {error} Audio is live.");
+            ui.add(egui::Label::new(RichText::new(message).color(AMBER)).wrap());
+        }
+        let recording = &self.broadcaster.recording_status;
+        if recording.phase == Phase::Error {
+            let message = format!("Recording · {}", recording.message);
+            ui.add(egui::Label::new(RichText::new(message).color(WARNING)).wrap());
+        }
     }
 
     fn library_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1428,14 +1502,19 @@ impl RustDj {
         self.live_inputs[index] = None;
         if index == MIC {
             self.mic_peak = 0.0;
+            self.mic_clip_until = None;
         }
     }
 
     fn update_inputs(&mut self, meter_decay: f32) {
         self.mic_peak *= meter_decay;
-        let mic_peak = self.live_inputs[MIC].as_ref()
+        let raw_peak = self.live_inputs[MIC].as_ref()
             .filter(|input| !input.disconnected())
-            .map(|input| input.take_peak() * self.input_settings[MIC].level.clamp(0.0, 1.0));
+            .map(LiveInput::take_peak);
+        if raw_peak.is_some_and(|peak| peak >= 0.999) {
+            self.mic_clip_until = Some(Instant::now() + Duration::from_millis(750));
+        }
+        let mic_peak = raw_peak.map(|peak| peak * self.input_settings[MIC].level.clamp(0.0, 1.0));
         self.mic_peak = self.mic_peak.max(mic_peak.unwrap_or(0.0));
         self.talkover.update(self.talkover_settings, mic_peak, Instant::now());
         for (index, live) in self.live_inputs.iter_mut().enumerate() {
@@ -1444,6 +1523,7 @@ impl RustDj {
                 *live = None;
                 if index == MIC {
                     self.mic_peak = 0.0;
+                    self.mic_clip_until = None;
                 }
                 self.input_errors[index] = Some("Audio input disconnected. Reconnect it and enable the input again.".into());
                 continue;
@@ -1935,6 +2015,7 @@ impl RustDj {
             Ok(audio) => {
                 audio.master_eq.set(self.master_eq);
                 audio.limiter.set(self.master_limiter);
+                audio.set_speaker_level(self.speaker_level);
                 self.jingles.stop_all();
                 let autodj_was_running = self.autodj.stop(&mut self.decks, &self.audio);
                 let mut errors = Vec::new();
@@ -2151,6 +2232,7 @@ impl eframe::App for RustDj {
         self.poll_keyring();
         self.browser.poll();
         self.midi.tick(ctx);
+        self.autodj.update(&mut self.decks, ctx);
         let mut loaded_this_frame = [None; COUNT];
         for (index, deck) in self.decks.iter_mut().enumerate() {
             if let Some(track) = deck.poll(&self.audio) {
@@ -2172,7 +2254,7 @@ impl eframe::App for RustDj {
         self.midi_actions(ctx);
         self.shortcuts(ctx);
         egui::TopBottomPanel::top("app-header")
-            .frame(egui::Frame::new().fill(BG).inner_margin(6.0))
+            .frame(egui::Frame::new().fill(BAR).inner_margin(6.0))
             .show(ctx, |ui| {
                 self.header(ui, ctx);
             });
@@ -2285,6 +2367,24 @@ impl eframe::App for RustDj {
                     drops.add(DropTarget::Playlist(None), playlist.rect, ui.layer_id());
                     let autodj = ui.selectable_value(tab, LibraryTab::AutoDj, "AutoDJ");
                     drops.add(DropTarget::AutoDj(None), autodj.rect, ui.layer_id());
+                    let active = match *tab {
+                        LibraryTab::Session => session.rect,
+                        LibraryTab::Playlist => playlist.rect,
+                        LibraryTab::AutoDj => autodj.rect,
+                    };
+                    let y = active.bottom() + 1.0;
+                    let mid = active.center().x;
+                    let indigo_light = Color32::from_rgb(129, 140, 248);
+                    let mut gradient = egui::Mesh::default();
+                    for (x, color) in [(active.left(), TEAL), (mid, indigo_light), (active.right(), VIOLET)] {
+                        gradient.colored_vertex(egui::pos2(x, y), color);
+                        gradient.colored_vertex(egui::pos2(x, y + 2.0), color);
+                    }
+                    gradient.add_triangle(0, 1, 2);
+                    gradient.add_triangle(2, 1, 3);
+                    gradient.add_triangle(2, 3, 4);
+                    gradient.add_triangle(4, 3, 5);
+                    ui.painter().add(egui::Shape::mesh(gradient));
                     if playlist.clicked() {
                         self.playlist.refresh(ctx);
                     }
@@ -2469,7 +2569,6 @@ impl eframe::App for RustDj {
                 self.hotcue_store.save(snapshot);
             }
         }
-        self.autodj.update(&mut self.decks, ctx);
         self.log_audible_tracks(&gains, now);
         let dominant = (0..COUNT)
             .filter(|i| self.decks[*i].playing() && gains.master[*i] > 0.0001)
@@ -2529,6 +2628,7 @@ impl eframe::App for RustDj {
                 routing: self.audio.routing.clone(),
                 mix: MixSettings {
                     master: self.master,
+                    speaker_level: self.speaker_level,
                     phones: self.phones,
                     mixing: self.mixing,
                     crossfader_enabled: self.crossfader.enabled,
@@ -2610,30 +2710,43 @@ fn export_history(path: &std::path::Path) -> Result<(), String> {
     file.flush().map_err(|error| error.to_string())
 }
 
-fn broadcast_status_ui(ui: &mut egui::Ui, name: &str, status: &Status, active: &str, color: Color32) {
-    let phase = if status.phase == Phase::Running {
-        active
-    } else {
-        status.label()
+fn broadcast_status_ui(ui: &mut egui::Ui, status: &Status, recording: bool) {
+    let (label, color) = match status.phase {
+        Phase::Running if recording => ("REC", WARNING),
+        Phase::Running => ("LIVE", SUCCESS),
+        Phase::Reconnecting => ("RECONNECTING", RECONNECT),
+        Phase::Error if recording => ("REC ERROR", WARNING),
+        Phase::Error => ("STREAM ERROR", WARNING),
+        Phase::Idle | Phase::Done if recording => ("REC OFF", MUTED),
+        Phase::Idle | Phase::Done => ("OFFLINE", MUTED),
+        _ => (status.label(), MUTED),
     };
-    let mut text = format!("{name} · {phase}");
-    if status.seconds > 0.0 {
-        let total_seconds = status.seconds as u64;
-        let (minutes, seconds) = (total_seconds / 60, total_seconds % 60);
-        text.push_str(&format!(" · {minutes:02}:{seconds:02}"));
-    }
-    let color = match status.phase {
-        Phase::Error | Phase::Reconnecting => {
-            text.push_str(" · ");
-            text.push_str(&status.message);
-            WARNING
+    let value = match status.phase {
+        Phase::Running => {
+            let total_seconds = status.seconds as u64;
+            format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
         }
-        Phase::Idle | Phase::Done => MUTED,
-        _ => color,
+        Phase::Reconnecting => status.retry_at.map_or_else(
+            || "Connecting…".into(),
+            |deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                format!("{}s", remaining.as_secs_f64().ceil() as u64)
+            },
+        ),
+        _ => String::new(),
     };
-    let response = ui.add(egui::Label::new(RichText::new(&text).strong().color(color)).truncate());
-    let mut details = text;
-    if !matches!(status.phase, Phase::Error | Phase::Reconnecting) && !status.message.is_empty() {
+    let response = ui
+        .horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.0, color);
+            ui.label(semibold(label).color(color));
+            if !value.is_empty() {
+                ui.label(RichText::new(&value).monospace().color(color));
+            }
+        })
+        .response;
+    let mut details = format!("{label} {value}");
+    if !status.message.is_empty() {
         details.push('\n');
         details.push_str(&status.message);
     }
@@ -2646,6 +2759,10 @@ fn broadcast_status_ui(ui: &mut egui::Ui, name: &str, status: &Status, active: &
         details.push_str(error);
     }
     response.on_hover_text(details);
+}
+
+fn semibold(text: &str) -> RichText {
+    RichText::new(text).family(egui::FontFamily::Name(SEMIBOLD.into()))
 }
 
 fn clock(time: Duration) -> String {
@@ -2719,7 +2836,7 @@ fn deck_ui(
                 .track
                 .as_ref()
                 .map_or("Drop music here", |t| t.title.as_str());
-            ui.add(egui::Label::new(RichText::new(title).strong()).truncate())
+            ui.add(egui::Label::new(semibold(title)).truncate())
                 .on_hover_text(title);
             let duration = deck.track.as_ref().map_or(Duration::ZERO, |t| t.duration);
             let position = deck.position();
@@ -2744,9 +2861,10 @@ fn deck_ui(
                         .size(15.0)
                         .color(color),
                 );
-                let bpm = deck.grid.map_or("Set BPM".into(), |g| {
-                    format!("{:.1} BPM", g.bpm * deck.speed)
-                });
+                let bpm = deck.grid.map_or_else(
+                    || RichText::new("Set BPM"),
+                    |grid| RichText::new(format!("{:.1} BPM", grid.bpm * deck.speed)).monospace(),
+                );
                 ui.menu_button(bpm, |ui| {
                     if let Some(grid) = &mut deck.grid {
                         ui.add(
@@ -3236,12 +3354,12 @@ fn fx_knob(
 }
 
 impl RustDj {
-    fn mic_mixer_ui(&mut self, ui: &mut egui::Ui) {
+    fn live_mic_ui(&mut self, ui: &mut egui::Ui) {
         let active = self.live_inputs[MIC].is_some();
         let (text, color) = if self.input_errors[MIC].is_some() {
             ("MIC ERR", WARNING)
         } else if active {
-            ("MIC ON", LIGHT_PURPLE)
+            ("MIC ON", SUCCESS)
         } else {
             ("MIC OFF", MUTED)
         };
@@ -3251,7 +3369,7 @@ impl RustDj {
         if ui
             .add_sized(
                 [62.0, 17.0],
-                egui::Button::new(RichText::new(text).color(color)).small().selected(active),
+                egui::Button::new(semibold(text).color(color)).small().selected(active),
             )
             .on_hover_text(hint)
             .clicked()
@@ -3272,9 +3390,10 @@ impl RustDj {
             self.audio_dirty = true;
         }
         let display = peak_text(self.mic_peak);
-        let fill = if self.mic_peak >= 1.0 { WARNING } else { LIGHT_PURPLE };
+        let clipping = self.mic_clip_until.is_some_and(|until| until > Instant::now());
+        let fill = if clipping { WARNING } else { SUCCESS };
         let visible = ((peak_db(self.mic_peak) + 60.0) / 60.0).clamp(0.0, 1.0);
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(42.0, 8.0), Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(128.0, 10.0), Sense::hover());
         ui.painter().rect_filled(rect, 2.0, BG);
         if visible > 0.0 {
             ui.painter().rect_filled(
@@ -3283,7 +3402,18 @@ impl RustDj {
                 fill,
             );
         }
-        response.on_hover_text(format!("Microphone: {display}"));
+        let meter_color = if clipping { WARNING } else { MUTED };
+        let clip_mark = Rect::from_min_max(
+            egui::pos2(rect.right() - 2.0, rect.top()),
+            rect.right_bottom(),
+        );
+        ui.painter().rect_filled(clip_mark, 1.0, meter_color);
+        response.on_hover_text("Microphone level after the input fader. CLIP indicates input overload.");
+        let reading = if clipping { format!("{display} CLIP") } else { display };
+        ui.add_sized(
+            [86.0, 17.0],
+            egui::Label::new(RichText::new(reading).monospace().color(meter_color)),
+        );
     }
 
     fn mixer_ui(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -3345,16 +3475,28 @@ impl RustDj {
             ui.separator();
             output_levels_ui(ui, &mut self.master, &mut self.phones, &mut self.mixing);
             ui.horizontal(|ui| {
+                ui.label(RichText::new("SPEAKERS").size(9.0).strong().color(TEAL));
+                if ui.add(egui::Slider::new(&mut self.speaker_level, 0.0..=1.0)
+                    .custom_formatter(|level, _| format!("{:.0}%", level * 100.0))
+                    .custom_parser(|text| text.trim().trim_end_matches('%').parse::<f64>().ok().map(|percent| percent / 100.0)))
+                    .on_hover_text("Local speaker volume")
+                    .changed()
+                {
+                    self.audio.set_speaker_level(self.speaker_level);
+                    self.audio_dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (index, label, color) in [(0, "MASTER", PURPLE), (1, "PHONES", LIGHT_PURPLE)] {
                     let [left, right] = self.bus_levels[index];
                     let text = RichText::new(format!("{label} {}", peak_text(left.max(right))))
+                        .monospace()
                         .size(10.0)
                         .color(color);
                     ui.add_sized([91.0, 17.0], egui::Label::new(text).truncate());
                     ui.separator();
                 }
-                self.mic_mixer_ui(ui);
             });
             ui.separator();
             ui.horizontal(|ui| {
@@ -3556,7 +3698,7 @@ pub(crate) fn output_levels_ui(
                 "MASTER",
                 master,
                 PURPLE,
-                "Volume of the master, stream and recording",
+                "Program level for streaming, recording and the speaker mix",
             ),
             (
                 "HEADPHONES",

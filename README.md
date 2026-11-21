@@ -2,7 +2,7 @@
   <img src="assets/branding/rustdj-logo.png" alt="RustDJ" width="480">
 </p>
 
-# RustDJ 0.24.4
+# RustDJ 0.24.6
 
 RustDJ is a desktop DJ and broadcasting app for Windows and Linux. Mix with
 two or four decks, browse your music, and send the master mix to SHOUTcast
@@ -31,7 +31,7 @@ repository root, install the amd64 package and launch RustDJ from the
 application menu or run `rustdj`.
 
 ```bash
-sudo apt install ./outputs/rustdj_0.24.4_amd64.deb
+sudo apt install ./outputs/rustdj_0.24.6_amd64.deb
 ```
 
 The Linux build was tested on Linux Mint 22.3, which uses an Ubuntu 24.04
@@ -76,10 +76,11 @@ vertically. **GAIN**, the channel fader, its meter and headphone **CUE** sit
 alongside them. Gain and the three EQ bands range from -24 to +12 dB.
 Double-click an EQ or gain knob to reset it to 0 dB.
 
-**MASTER**, **HEADPHONES** and **CUE / MASTER** remain visible in both central
-mixer tabs. Their values are saved automatically.
+**MASTER**, **SPEAKERS**, **HEADPHONES** and **CUE / MASTER** remain visible in
+both central mixer tabs. Their values are saved automatically.
 
 - **MASTER** controls the speaker mix, SHOUTcast stream and MP3 recording.
+- **SPEAKERS** adjusts only the local speaker output.
 - **HEADPHONES** controls the selected headphone output.
 - **CUE / MASTER** blends pre-fader cue audio with the program mix in headphones.
   The headphone program mix is taken before the software master level, so it
@@ -184,8 +185,9 @@ browser and choose **Add to AutoDJ**, drag tracks onto the tab, or use
 **Add selection**, **Files …** and **Add playlist** to build the list.
 Select an entry to reorder or remove it while AutoDJ is stopped. Choose a deck
 in the AutoDJ tab and press **Start AutoDJ**. RustDJ shows that deck, loads the
-first track and starts it automatically. At the end of a track, AutoDJ loads
-and plays the next entry on the same deck. The deck fader, crossfader and master
+first track and starts it automatically. While the current track plays, AutoDJ
+prepares the next entry in the background. At the end of the track, it plays
+that entry on the same deck. The deck fader, crossfader and master
 volume control the sound. **Next** skips a track. **Stop** in AutoDJ or on the
 deck ends the run and cancels a pending track. AutoDJ skips unavailable files
 and stops after the last track. Manually loading the AutoDJ deck takes it back
@@ -350,9 +352,12 @@ remembered, and both inputs start disabled when RustDJ opens.
 
 ## SHOUTcast streaming and MP3 recording
 
-Start or stop a stream or MP3 recording from the main window header. **STREAM**
-and **REC** show the current state and elapsed time. Hover over either status for
-details, including the recording file or connection errors. Click **STREAMER**
+Start or stop a stream or MP3 recording from the live bar in the main window.
+It stays visible in Library view and shows the current broadcast and recording
+state, elapsed time, and the retry countdown. The microphone switch, level
+control and meter are alongside them. **CLIP** flags overload at the input,
+even when the microphone fader is turned down. Hover over a broadcast or
+recording status for details, including the recording file or connection errors. Click **STREAMER**
 in the central mixer to open **SHOUTcast / MP3 Recording** and edit its settings.
 
 Use **New profile** in **STREAMER** to save another destination. Give it a
@@ -364,7 +369,10 @@ becomes the **Default** profile.
 Both features capture the stereo master after channel processing,
 crossfader, master EQ and the optional limiter. Enabled microphones, external
 inputs and playing jingles are part of that mix. Headphone cue has its own bus.
-The **MASTER** control sets the level for speakers, streaming and recording.
+**MASTER** sets the program level for streaming, recording and the speaker mix.
+The mixer's **SPEAKERS** control adjusts the local output after the capture tap,
+so it can mute the speakers without lowering the stream, recording or headphones.
+Existing configurations start with **SPEAKERS** at 100%.
 
 Enter the hostname/IP, source port, metadata/admin port, stream ID, source
 password and optional station details. **TLS (certificate verified)** is the
@@ -415,6 +423,8 @@ Streaming and recording never start automatically.
 Audio capture uses bounded buffers and background workers for encoding, disk
 writes and networking. The header and streamer window report connection and
 recording errors. Enable reconnect per profile to retry a dropped broadcast.
+The main window shows the error, the time until the next retry and whether local
+recording continues.
 
 ## Live tools
 

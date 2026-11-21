@@ -25,3 +25,9 @@ under the webpki-roots license. License texts for these libraries and their
 new runtime support dependencies are included under third_party/licenses.
 See Cargo.lock for the exact versions. rcgen is used only by local tests to
 generate ephemeral certificates and is not included in the executable.
+
+## Inter typeface
+
+RustDJ embeds Inter Regular and Inter Semibold from Aurora Viewer. Inter is
+distributed under the SIL Open Font License 1.1. The license and copyright
+notice are included in third_party/licenses/Inter-OFL.txt.

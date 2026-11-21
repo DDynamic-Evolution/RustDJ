@@ -34,6 +34,7 @@ pub struct Settings {
 #[serde(default)]
 pub struct MixSettings {
     pub master: f32,
+    pub speaker_level: f32,
     pub phones: f32,
     pub mixing: f32,
     pub crossfader_enabled: bool,
@@ -42,6 +43,7 @@ impl Default for MixSettings {
     fn default() -> Self {
         Self {
             master: 0.7,
+            speaker_level: 1.0,
             phones: 0.4,
             mixing: 0.0,
             crossfader_enabled: true,

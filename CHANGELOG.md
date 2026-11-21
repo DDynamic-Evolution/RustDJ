@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.24.6
+
+- Added a persistent live bar for stream state, reconnect countdown, recording time and microphone controls, including in Library view.
+- Added a wider microphone meter and a clip indicator for input overload.
+- Adopted Aurora's Inter typography and fixed-width readouts for live status and mixer values.
+
+## 0.24.5
+
+- Added a separate local speaker level that leaves streaming, recording and headphones unaffected.
+- AutoDJ preloads the next track while the current one plays.
+- The main window shows stream errors, reconnect timing and whether local recording continues.
+- Applied Aurora Viewer styling to the header, mixer and library, and resized the embedded header logo to avoid startup failures on texture-limited renderers.
+
 ## 0.24.4
 
 - AutoDJ loads and plays its queue on a selectable deck with the normal waveform, transport and mixer controls.

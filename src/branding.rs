@@ -2,7 +2,7 @@
 use eframe::egui;
 
 const ICON: &[u8] = include_bytes!("../assets/branding/rustdj-window-icon.png");
-const LOGO: &[u8] = include_bytes!("../assets/branding/rustdj-logo.png");
+const LOGO: &[u8] = include_bytes!("../assets/branding/rustdj-header-logo.png");
 
 pub fn window_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(ICON).expect("valid embedded RustDJ icon")

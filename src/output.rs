@@ -38,6 +38,9 @@ struct MeteredBus {
     equalizer: Option<crate::equalizer::Processor>,
     limiter: Option<(Arc<LimiterControl>, Limiter)>,
     pending_right: Option<f32>,
+    speaker_level: Option<Arc<AtomicU32>>,
+    speaker_gain: f32,
+    speaker_smoothing: f32,
 }
 impl Iterator for MeteredBus {
     type Item = f32;
@@ -75,6 +78,16 @@ impl Iterator for MeteredBus {
                 capture.push(self.frame);
             }
         }
+        // Capture and meter the program before applying the local stereo gain.
+        let value = match &self.speaker_level {
+            Some(level) if self.channel == self.pair * 2 => {
+                let target = f32::from_bits(level.load(Ordering::Relaxed));
+                self.speaker_gain += (target - self.speaker_gain) * self.speaker_smoothing;
+                value * self.speaker_gain
+            }
+            Some(_) if self.channel == self.pair * 2 + 1 => value * self.speaker_gain,
+            _ => value,
+        };
         self.channel = (self.channel + 1) % self.source.channels();
         Some(value)
     }
@@ -118,6 +131,9 @@ fn metered_bus(
             equalizer: None,
             limiter: None,
             pending_right: None,
+            speaker_level: None,
+            speaker_gain: 1.0,
+            speaker_smoothing: 1.0 - (-1.0 / (0.005 * rate as f32)).exp(),
         },
     )
 }
@@ -177,6 +193,7 @@ pub struct Audio {
     pub capture: Arc<crate::capture::MasterCapture>,
     pub master_eq: Arc<crate::equalizer::Params>,
     pub limiter: Arc<LimiterControl>,
+    speaker_level: Arc<AtomicU32>,
 }
 
 impl Default for Audio {
@@ -243,6 +260,10 @@ pub fn validate_pairs(
 }
 
 impl Audio {
+    pub fn set_speaker_level(&self, level: f32) {
+        self.speaker_level.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
     pub fn new(routing: Routing) -> Self {
         match Self::open(routing.clone()) {
             Ok(audio) => audio,
@@ -261,6 +282,7 @@ impl Audio {
                 capture: Arc::new(crate::capture::MasterCapture::new(44100)),
                 master_eq: Arc::default(),
                 limiter: Arc::default(),
+                speaker_level: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             },
         }
     }
@@ -311,6 +333,8 @@ impl Audio {
         let limiter = Arc::new(LimiterControl::default());
         master_source.limiter =
             Some((limiter.clone(), Limiter::new(stream.config().sample_rate())));
+        let speaker_level = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        master_source.speaker_level = Some(speaker_level.clone());
         stream.mixer().add(master_source);
         let phones_output = if shared {
             Some(&stream)
@@ -345,6 +369,7 @@ impl Audio {
             capture,
             master_eq,
             limiter,
+            speaker_level,
         })
     }
 
@@ -770,6 +795,37 @@ mod tests {
         assert_eq!(captured, played[2..]);
         assert!((captured[0] - 0.891_250_9).abs() < 0.0001);
         assert!((captured[1] * 2.0 + captured[0]).abs() < 0.0001);
+    }
+
+    #[test]
+    fn speaker_level_changes_only_the_local_master_pair() {
+        let rate = 48_000;
+        let peaks = Arc::new(StereoPeaks::default());
+        let (bus, mut source) = metered_bus(4, rate, 1, peaks.clone());
+        let capture = Arc::new(crate::capture::MasterCapture::new(rate));
+        let speakers = Arc::new(AtomicU32::new(0.25_f32.to_bits()));
+        source.capture = Some(capture.clone());
+        source.speaker_level = Some(speakers.clone());
+        capture.stream.begin();
+        capture.recording.begin();
+
+        let input = [0.1, -0.2, 0.8, -0.4];
+        for level in [0.25_f32, 0.0, 1.0] {
+            speakers.store(level.to_bits(), Ordering::Relaxed);
+            bus.add(rodio::buffer::SamplesBuffer::new(4, rate, input.repeat(4096)));
+            let played: Vec<_> = source.by_ref().take(4096 * 4).collect();
+            let frame = played.last_chunk::<4>().unwrap();
+            assert_eq!(&frame[..2], &input[..2]);
+            assert!((frame[2] - input[2] * level).abs() < 0.0001);
+            assert!((frame[3] - input[3] * level).abs() < 0.0001);
+            assert_eq!(peaks.take(), [0.8, 0.4]);
+
+            for buffer in [&capture.stream, &capture.recording] {
+                let mut captured = Vec::new();
+                assert_eq!(buffer.drain(&mut captured, 4096), 4096);
+                assert!(captured.as_chunks::<2>().0.iter().all(|frame| *frame == [0.8, -0.4]));
+            }
+        }
     }
 
     #[test]

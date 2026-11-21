@@ -115,6 +115,7 @@ pub struct Status {
     pub seconds: f64,
     pub path: Option<PathBuf>,
     pub metadata_error: Option<String>,
+    pub retry_at: Option<Instant>,
 }
 
 impl Status {
@@ -155,18 +156,21 @@ impl Job {
         let thread_status = status.clone();
         let thread = thread::spawn(move || {
             let result = work(thread_stop.clone(), thread_status.clone());
-            update(&thread_status, |status| match result {
-                Ok(()) => {
-                    status.phase = Phase::Done;
-                    status.message = "Stopped".into();
-                }
-                Err(error) if thread_stop.load(Ordering::Acquire) => {
-                    status.phase = Phase::Done;
-                    status.message = format!("Stopped: {error}");
-                }
-                Err(error) => {
-                    status.phase = Phase::Error;
-                    status.message = error;
+            update(&thread_status, |status| {
+                status.retry_at = None;
+                match result {
+                    Ok(()) => {
+                        status.phase = Phase::Done;
+                        status.message = "Stopped".into();
+                    }
+                    Err(error) if thread_stop.load(Ordering::Acquire) => {
+                        status.phase = Phase::Done;
+                        status.message = format!("Stopped: {error}");
+                    }
+                    Err(error) => {
+                        status.phase = Phase::Error;
+                        status.message = error;
+                    }
                 }
             });
         });
@@ -453,17 +457,19 @@ fn run_broadcast(
             }
             let delay = 1 << attempts;
             attempts += 1;
+            let deadline = Instant::now() + Duration::from_secs(delay);
             update(status, |status| {
                 status.phase = Phase::Reconnecting;
-                status.message = format!("Attempt {attempts} of 5 in {delay}s. {failure}");
+                status.message = format!("Attempt {attempts} of 5. {failure}");
+                status.retry_at = Some(deadline);
             });
-            let deadline = Instant::now() + Duration::from_secs(delay);
             while Instant::now() < deadline {
                 if stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            update(status, |status| status.retry_at = None);
             let mut connection = match connector.connect(
                 &settings.host,
                 settings.source_port,

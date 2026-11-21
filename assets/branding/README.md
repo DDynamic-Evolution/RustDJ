@@ -2,7 +2,8 @@
 
 The approved violet record / negative-space R / lavender waveform identity is embedded in the application header and native window. Windows MSVC builds also embed the multi-resolution executable icon and version information using the Windows SDK resource compiler.
 
-- `rustdj-logo.png`: horizontal logo on a dark background.
+- `rustdj-logo.png`: original horizontal logo on a dark background.
+- `rustdj-header-logo.png`: 480 × 160 px version embedded in the app header.
 - `rustdj-icon.png`: original app icon with transparent corners.
 - `rustdj-window-icon.png`: 256 px window icon, derived from the original PNG.
 - `rustdj.ico`: Windows icon with 16, 20, 24, 32, 40, 48, 64, 128 and 256 px images.

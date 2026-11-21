@@ -1,5 +1,5 @@
 use crate::{
-    audio::{Audio, Deck},
+    audio::{Audio, Deck, LoadJob},
     decks::COUNT,
     dragdrop::{self, Music, Origin, Selection, Target, Zones},
     playlist::Item,
@@ -16,6 +16,7 @@ struct Run {
     index: usize,
     load_serial: u64,
     loading: bool,
+    next: Option<LoadJob>,
 }
 
 pub enum Control {
@@ -96,22 +97,34 @@ impl AutoDj {
             return false;
         }
         self.reset_status();
-        self.load(deck, 0, target, ctx);
+        self.load(deck, 0, target, ctx, None);
         true
     }
 
-    fn load(&mut self, deck: usize, index: usize, target: &mut Deck, ctx: &egui::Context) {
+    fn load(
+        &mut self,
+        deck: usize,
+        index: usize,
+        target: &mut Deck,
+        ctx: &egui::Context,
+        prepared: Option<LoadJob>,
+    ) {
         let Some(path) = self.paths.get(index) else {
             self.run = None;
             self.finished = true;
             return;
         };
-        target.load(path.clone(), ctx.clone());
+        if let Some(job) = prepared {
+            target.load_prepared(job);
+        } else {
+            target.load(path.clone(), ctx.clone());
+        }
         self.run = Some(Run {
             deck,
             index,
             load_serial: target.load_serial(),
             loading: true,
+            next: None,
         });
     }
 
@@ -139,7 +152,7 @@ impl AutoDj {
             let target = &mut decks[run.deck];
             if run.load_serial == target.load_serial() {
                 Self::release_deck(&run, target, audio);
-                self.load(run.deck, run.index + 1, target, ctx);
+                self.load(run.deck, run.index + 1, target, ctx, run.next);
             }
         }
     }
@@ -156,7 +169,7 @@ impl AutoDj {
     }
 
     pub fn update(&mut self, decks: &mut [Deck; COUNT], ctx: &egui::Context) {
-        let Some(run) = &self.run else {
+        let Some(run) = &mut self.run else {
             return;
         };
         let deck = &mut decks[run.deck];
@@ -172,10 +185,17 @@ impl AutoDj {
             let title = file_title(&self.paths[run.index]);
             let detail = deck.error.as_deref().unwrap_or("Could not start playback.");
             self.error = Some(format!("Skipped {title}. {detail}"));
-            self.load(run.deck, run.index + 1, deck, ctx);
-        } else if !run.loading && deck.reached_end() {
-            self.load(run.deck, run.index + 1, deck, ctx);
+        } else if run.loading || !deck.reached_end() {
+            if !run.loading
+                && run.next.is_none()
+                && let Some(path) = self.paths.get(run.index + 1)
+            {
+                run.next = Some(Deck::prepare_load(path.clone(), ctx.clone(), true));
+            }
+            return;
         }
+        let (deck_index, next_index, prepared) = (run.deck, run.index + 1, run.next.take());
+        self.load(deck_index, next_index, deck, ctx, prepared);
     }
 
     pub fn controls(
